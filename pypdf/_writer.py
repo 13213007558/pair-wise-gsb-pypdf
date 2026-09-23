@@ -1088,6 +1088,356 @@ class PdfWriter(PdfDocCommon):
                 if appearance_stream_obj and flatten:
                     self._add_apstream_object(page, appearance_stream_obj, field, rectangle[0], rectangle[1])
 
+    def flatten_fields(self, fields: Union[str, Iterable[str]]) -> None:
+        """
+        Flatten the selected form fields into the page contents.
+
+        For every selected field, the current appearance of each of its
+        widget annotations (including widgets on different pages) is painted
+        onto the page, the widgets are removed from the pages' /Annots
+        arrays and the field is removed from the AcroForm field tree. Parent
+        field nodes left without kids are pruned, while parents still shared
+        with other fields are kept. Fields that are not selected stay fully
+        editable.
+
+        The operation is atomic: all selected fields are validated before
+        the document is modified. If any selected field cannot be flattened,
+        an exception is raised and the document is left unchanged.
+
+        Args:
+            fields: A fully qualified field name (as returned by
+                get_fields) or an iterable of such names.
+
+        Raises:
+            PyPdfError: If the document has no AcroForm, a selected field
+                does not exist, is a signature field, or has no valid
+                appearance stream.
+
+        """
+        if isinstance(fields, str):
+            fields = [fields]
+        selected = list(dict.fromkeys(fields))
+        if CatalogAttributes.ACRO_FORM not in self._root_object:
+            raise PyPdfError("No /AcroForm dictionary in PDF of PdfWriter Object")
+        acro_form = cast(DictionaryObject, self._root_object[CatalogAttributes.ACRO_FORM])
+        if InteractiveFormDictEntries.Fields not in acro_form:
+            raise PyPdfError("No /Fields dictionary in PDF of PdfWriter Object")
+        fields_array = cast(ArrayObject, acro_form[InteractiveFormDictEntries.Fields])
+
+        # Phase 1: resolve and validate everything before modifying anything.
+        targets = []
+        for name in selected:
+            chain = self._find_field_chain(fields_array, name)
+            if chain is None:
+                raise PyPdfError(f"Cannot flatten unknown field {name!r}")
+            field_dict = chain[-1][0]
+            if self._effective_field_type(field_dict) == "/Sig":
+                raise PyPdfError(f"Signature field {name!r} cannot be flattened")
+            widgets: list[DictionaryObject] = []
+            self._collect_field_widgets(field_dict, widgets)
+            appearances = [
+                self._resolve_widget_appearance(widget, field_dict, name)
+                for widget in widgets
+            ]
+            targets.append((chain, widgets, appearances))
+
+        # Phase 2: paint the appearances and unlink the fields.
+        widget_locations = self._map_widgets_to_pages()
+        removable: list[IndirectObject] = []
+        painted: set[int] = set()
+        for (chain, widgets, appearances), name in zip(targets, selected):
+            for widget, appearance in zip(widgets, appearances):
+                if id(widget) in painted:
+                    # Already flattened as part of an ancestor field.
+                    continue
+                location = widget_locations.get(id(widget))
+                if location is None and widget.indirect_reference is not None:
+                    location = widget_locations.get(
+                        ("indirect", widget.indirect_reference.idnum)
+                    )
+                if location is None:
+                    # The widget is not referenced by any page's /Annots
+                    # array, so it is not displayed: nothing to paint.
+                    continue
+                page, annots = location
+                self._paint_widget_appearance(page, widget, appearance, name)
+                painted.add(id(widget))
+                for i, annot in enumerate(annots):
+                    if annot.get_object() is widget:
+                        if isinstance(annot, IndirectObject):
+                            removable.append(annot)
+                        del annots[i]
+                        break
+            # Unlink the field node, then prune ancestors left without kids.
+            for level in range(len(chain) - 1, -1, -1):
+                node, container, element = chain[level]
+                self._remove_array_element(container, element)
+                if isinstance(element, IndirectObject):
+                    removable.append(element)
+                if level == 0:
+                    break
+                parent_node = chain[level - 1][0]
+                if parent_node.get("/Subtype") == "/Widget":
+                    break
+                kids = parent_node.get(FA.Kids)
+                if not isinstance(kids, ArrayObject) or len(kids) > 0:
+                    break
+        self._null_unreferenced_objects(removable, fields_array)
+
+    def _find_field_chain(
+        self,
+        container: ArrayObject,
+        name: str,
+        prefix: str = "",
+    ) -> Optional[list[tuple[DictionaryObject, ArrayObject, PdfObject]]]:
+        """Locate a field by qualified name, returning the chain of
+        (node, container, element) tuples from the top level down to it."""
+        for element in container:
+            node = element.get_object()
+            if not isinstance(node, DictionaryObject):
+                continue
+            entry = (node, container, element)
+            local_name = node.get("/TM", node.get("/T"))
+            if local_name is not None:
+                qualified = f"{prefix}.{local_name}" if prefix else str(local_name)
+                if qualified == name:
+                    return [entry]
+            else:
+                qualified = prefix
+            kids = node.get(FA.Kids)
+            if isinstance(kids, ArrayObject):
+                sub_chain = self._find_field_chain(kids, name, qualified)
+                if sub_chain is not None:
+                    return [entry, *sub_chain]
+        return None
+
+    @staticmethod
+    def _effective_field_type(field: DictionaryObject) -> Optional[str]:
+        """Return the /FT of a field, inherited from its ancestors if needed."""
+        node: Optional[PdfObject] = field
+        visited = set()
+        while isinstance(node, DictionaryObject) and id(node) not in visited:
+            visited.add(id(node))
+            field_type = node.get(FA.FT)
+            if field_type is not None:
+                return str(field_type)
+            node = node.get(PG.PARENT)
+            if node is not None:
+                node = node.get_object()
+        return None
+
+    def _collect_field_widgets(
+        self, node: DictionaryObject, widgets: list[DictionaryObject]
+    ) -> None:
+        """Collect all widget annotation dictionaries below a field node."""
+        if node.get("/Subtype") == "/Widget":
+            widgets.append(node)
+        kids = node.get(FA.Kids)
+        if isinstance(kids, ArrayObject):
+            for kid in kids:
+                kid_object = kid.get_object()
+                if isinstance(kid_object, DictionaryObject):
+                    self._collect_field_widgets(kid_object, widgets)
+
+    @staticmethod
+    def _resolve_widget_appearance(
+        widget: DictionaryObject, field: DictionaryObject, name: str
+    ) -> StreamObject:
+        """Return the appearance stream to flatten a widget with.
+
+        For button fields, the stream matching the current /AS state is used.
+        Raises PyPdfError if no valid appearance exists.
+        """
+        failure = PyPdfError(
+            f"Field {name!r} has no valid appearance stream and cannot be flattened"
+        )
+        if AA.Rect not in widget:
+            raise failure
+        appearance = widget.get(AA.AP)
+        if appearance is not None:
+            appearance = appearance.get_object()
+        normal = (
+            appearance.get("/N")
+            if isinstance(appearance, DictionaryObject)
+            else None
+        )
+        if normal is not None:
+            normal = normal.get_object()
+        stream: Optional[PdfObject] = None
+        if isinstance(normal, StreamObject):
+            stream = normal
+        elif isinstance(normal, DictionaryObject):
+            # Button-style appearance: a dictionary of states.
+            state = widget.get(AA.AS, field.get(FA.V, NameObject("/Off")))
+            stream = normal.get(state, normal.get(NameObject("/Off")))
+            if stream is not None:
+                stream = stream.get_object()
+        if not isinstance(stream, StreamObject) or "/BBox" not in stream:
+            raise failure
+        return stream
+
+    def _map_widgets_to_pages(
+        self,
+    ) -> dict[Any, tuple[PageObject, ArrayObject]]:
+        """Map widget annotations to their page and /Annots array."""
+        locations: dict[Any, tuple[PageObject, ArrayObject]] = {}
+        for page in self.pages:
+            annots = page.get(PG.ANNOTS)
+            if annots is None:
+                continue
+            annots = annots.get_object()
+            if not isinstance(annots, ArrayObject):
+                continue
+            for annot in annots:
+                annot_object = annot.get_object()
+                if (
+                    isinstance(annot_object, DictionaryObject)
+                    and annot_object.get("/Subtype") == "/Widget"
+                ):
+                    locations[id(annot_object)] = (page, annots)
+                    if isinstance(annot, IndirectObject):
+                        locations[("indirect", annot.idnum)] = (page, annots)
+        return locations
+
+    def _paint_widget_appearance(
+        self,
+        page: PageObject,
+        widget: DictionaryObject,
+        appearance: StreamObject,
+        name: str,
+    ) -> None:
+        """Paint a widget's appearance stream onto the page contents.
+
+        The appearance's /BBox and /Matrix, the widget rectangle and the
+        widget rotation (/MK /R) are honored. As the page content stream and
+        the annotation rectangle share the page's default user space, the
+        placement is correct for rotated pages as well.
+        """
+        rect = cast(RectangleObject, widget[AA.Rect])
+        bbox = cast(ArrayObject, appearance["/BBox"])
+        matrix = appearance.get("/Matrix")
+        form_matrix = (
+            Transformation(tuple(float(value) for value in matrix))  # type: ignore[arg-type]
+            if matrix is not None
+            else Transformation()
+        )
+        corners = [
+            (float(bbox[0]), float(bbox[1])),
+            (float(bbox[2]), float(bbox[1])),
+            (float(bbox[0]), float(bbox[3])),
+            (float(bbox[2]), float(bbox[3])),
+        ]
+        transformed = [
+            (
+                form_matrix.ctm[0] * x + form_matrix.ctm[2] * y + form_matrix.ctm[4],
+                form_matrix.ctm[1] * x + form_matrix.ctm[3] * y + form_matrix.ctm[5],
+            )
+            for x, y in corners
+        ]
+        min_x = min(point[0] for point in transformed)
+        min_y = min(point[1] for point in transformed)
+        width = max(point[0] for point in transformed) - min_x
+        height = max(point[1] for point in transformed) - min_y
+        rect_left = float(rect[0])
+        rect_bottom = float(rect[1])
+        rect_width = float(rect[2]) - rect_left
+        rect_height = float(rect[3]) - rect_bottom
+        ctm = (
+            Transformation()
+            .translate(-min_x, -min_y)
+            .scale(
+                rect_width / width if width else 1.0,
+                rect_height / height if height else 1.0,
+            )
+            .translate(rect_left, rect_bottom)
+        )
+        characteristics = widget.get("/MK")
+        if characteristics is not None:
+            characteristics = characteristics.get_object()
+        rotation = (
+            float(characteristics.get("/R", 0))
+            if isinstance(characteristics, DictionaryObject)
+            else 0.0
+        )
+        if rotation:
+            center_x = rect_left + rect_width / 2
+            center_y = rect_bottom + rect_height / 2
+            ctm = (
+                ctm.translate(-center_x, -center_y)
+                .rotate(rotation)
+                .translate(center_x, center_y)
+            )
+
+        if PG.RESOURCES not in page:
+            page[NameObject(PG.RESOURCES)] = DictionaryObject()
+        page_resources = cast(DictionaryObject, page[PG.RESOURCES].get_object())
+        xobjects = page_resources.get("/XObject")
+        if xobjects is None:
+            xobjects = DictionaryObject()
+            page_resources[NameObject("/XObject")] = xobjects
+        xobjects = cast(DictionaryObject, xobjects.get_object())
+        base = re.sub(r"[^A-Za-z0-9]", "_", name) or "field"
+        suffix = 0
+        while True:
+            xobject_name = NameObject(f"/Flat_{base}" + (f"_{suffix}" if suffix else ""))
+            if xobject_name not in xobjects:
+                break
+            suffix += 1
+        xobjects[xobject_name] = self._add_object(appearance)
+        drawing_commands = f"q\n{ctm._to_cm()}\n{xobject_name} Do\nQ".encode()
+        self._merge_content_stream_to_page(page, drawing_commands)
+
+    @staticmethod
+    def _remove_array_element(container: ArrayObject, element: PdfObject) -> None:
+        """Remove the first occurrence of an element from an array."""
+        for i, candidate in enumerate(container):
+            if candidate is element or (
+                isinstance(candidate, IndirectObject)
+                and isinstance(element, IndirectObject)
+                and candidate.idnum == element.idnum
+                and candidate.generation == element.generation
+                and candidate.pdf is element.pdf
+            ):
+                del container[i]
+                return
+
+    def _null_unreferenced_objects(
+        self, candidates: list[IndirectObject], fields_array: ArrayObject
+    ) -> None:
+        """Null out removed objects that nothing else references anymore.
+
+        Objects still used by remaining fields or page annotations (for
+        example shared parents or shared widgets) are left untouched.
+        """
+        referenced: set[int] = set()
+
+        def collect(container: ArrayObject) -> None:
+            for element in container:
+                if isinstance(element, IndirectObject):
+                    referenced.add(element.idnum)
+                element_object = element.get_object()
+                if isinstance(element_object, DictionaryObject):
+                    kids = element_object.get(FA.Kids)
+                    if isinstance(kids, ArrayObject):
+                        collect(kids)
+
+        collect(fields_array)
+        for page in self.pages:
+            annots = page.get(PG.ANNOTS)
+            if annots is not None:
+                annots = annots.get_object()
+            if isinstance(annots, ArrayObject):
+                for annot in annots:
+                    if isinstance(annot, IndirectObject):
+                        referenced.add(annot.idnum)
+        for candidate in candidates:
+            if (
+                candidate.idnum not in referenced
+                and getattr(candidate, "pdf", None) is self
+                and 0 < candidate.idnum <= len(self._objects)
+            ):
+                self._objects[candidate.idnum - 1] = NullObject()
+
     def reattach_fields(
         self, page: Optional[PageObject] = None
     ) -> list[DictionaryObject]:

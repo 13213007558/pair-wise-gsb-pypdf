@@ -126,6 +126,8 @@ from .xmp import XmpInformation
 
 ALL_DOCUMENT_PERMISSIONS = UserAccessPermissions.all()
 
+_ATTACHMENT_CONFLICT_STRATEGIES = ("keep", "rename", "reject", "replace")
+
 
 class ObjectDeletionFlag(enum.IntFlag):
     NONE = 0
@@ -2659,6 +2661,8 @@ class PdfWriter(PdfDocCommon):
         pages: Union[PageRange, tuple[int, int], tuple[int, int, int], list[int], list[PageObject], None] = None,
         import_outline: bool = True,
         excluded_fields: Optional[Union[list[str], tuple[str, ...]]] = None,
+        import_attachments: bool = True,
+        attachment_conflicts: str = "keep",
     ) -> None:
         """
         Identical to the :meth:`merge()<merge>` method, but assumes you want to
@@ -2683,6 +2687,14 @@ class PdfWriter(PdfDocCommon):
             excluded_fields: Provide the list of fields/keys to be ignored
                 if ``/Annots`` is part of the list, the annotation will be ignored
                 if ``/B`` is part of the list, the articles will be ignored
+            import_attachments: You may prevent the source document's
+                attachments (embedded files) from being imported by specifying
+                this as ``False``.
+            attachment_conflicts: How to handle imported attachments whose name
+                already exists in the target document: ``"keep"`` (default)
+                preserves both attachments separately, ``"rename"`` renames the
+                imported attachment, ``"reject"`` skips the imported attachment
+                and ``"replace"`` replaces the existing attachment.
 
         """
         if excluded_fields is None:
@@ -2700,6 +2712,8 @@ class PdfWriter(PdfDocCommon):
                 pages,
                 import_outline,
                 excluded_fields,
+                import_attachments,
+                attachment_conflicts,
             )
         else:  # if isinstance(outline_item, str):
             self.merge(
@@ -2709,6 +2723,8 @@ class PdfWriter(PdfDocCommon):
                 pages,
                 import_outline,
                 excluded_fields,
+                import_attachments,
+                attachment_conflicts,
             )
 
     def merge(
@@ -2719,6 +2735,8 @@ class PdfWriter(PdfDocCommon):
         pages: Optional[Union[PageRangeSpec, list[PageObject]]] = None,
         import_outline: bool = True,
         excluded_fields: Optional[Union[list[str], tuple[str, ...]]] = (),
+        import_attachments: bool = True,
+        attachment_conflicts: str = "keep",
     ) -> None:
         """
         Merge the pages from the given file into the output file at the
@@ -2744,11 +2762,25 @@ class PdfWriter(PdfDocCommon):
             excluded_fields: provide the list of fields/keys to be ignored
                 if ``/Annots`` is part of the list, the annotation will be ignored
                 if ``/B`` is part of the list, the articles will be ignored
+            import_attachments: You may prevent the source document's
+                attachments (embedded files) from being imported by specifying
+                this as ``False``.
+            attachment_conflicts: How to handle imported attachments whose name
+                already exists in the target document: ``"keep"`` (default)
+                preserves both attachments separately, ``"rename"`` renames the
+                imported attachment, ``"reject"`` skips the imported attachment
+                and ``"replace"`` replaces the existing attachment.
 
         Raises:
             TypeError: The pages attribute is not configured properly
+            ValueError: The attachment_conflicts attribute is not configured properly
 
         """
+        if attachment_conflicts not in _ATTACHMENT_CONFLICT_STRATEGIES:
+            raise ValueError(
+                f'"attachment_conflicts" must be one of {_ATTACHMENT_CONFLICT_STRATEGIES}, '
+                f"got {attachment_conflicts!r}"
+            )
         if isinstance(fileobj, PdfDocCommon):
             reader = fileobj
         else:
@@ -2872,6 +2904,285 @@ class PdfWriter(PdfDocCommon):
 
         if "/B" not in excluded_fields:
             self.add_filtered_articles("", srcpages, reader)
+
+        if import_attachments:
+            self._merge_attachments(reader, attachment_conflicts)
+
+    def _merge_attachments(
+        self,
+        reader: PdfDocCommon,
+        attachment_conflicts: str = "keep",
+    ) -> None:
+        """
+        Import the embedded files (attachments) of the source document.
+
+        This migrates the ``/Names`` -> ``/EmbeddedFiles`` name tree entries and
+        the catalog ``/AF`` array. The file specifications (including
+        ``/AFRelationship`` and the embedded file stream parameters) are cloned;
+        file specifications that were already cloned together with their page
+        (``/AF``) or annotation (``/FS``) are shared, so that all references
+        within one source document keep pointing to the same object.
+
+        Args:
+            reader: The source document.
+            attachment_conflicts: How to handle imported attachments whose name
+                already exists in the target document (see :meth:`merge`).
+
+        Raises:
+            PdfReadError: If a reference cannot be migrated.
+
+        """
+        src_root = reader.root_object
+        names_dict = src_root["/Names"] if "/Names" in src_root else None
+        has_embedded_files = (
+            isinstance(names_dict, DictionaryObject)
+            and "/EmbeddedFiles" in names_dict
+            and not is_null_or_none(names_dict["/EmbeddedFiles"])
+        )
+        has_associated_files = "/AF" in src_root and not is_null_or_none(src_root["/AF"])
+        if not has_embedded_files and not has_associated_files:
+            # Documents without attachments keep the historical code path
+            # (and byte-identical output).
+            return
+
+        # Collect everything before modifying the writer: any reference that
+        # cannot be migrated raises here, before anything is written.
+        name_entries: list[tuple[str, DictionaryObject]] = []
+        if has_embedded_files:
+            for embedded_file in EmbeddedFile._load(src_root, strict=True):
+                if not isinstance(embedded_file.name, str):
+                    raise PdfReadError(
+                        "Cannot migrate attachment: "
+                        f"the name tree key is not a string: {embedded_file.name!r}"
+                    )
+                if not isinstance(embedded_file.pdf_object, DictionaryObject):
+                    raise PdfReadError(
+                        f"Cannot migrate attachment {embedded_file.name!r}: "
+                        "the referenced file specification cannot be resolved"
+                    )
+                name_entries.append((embedded_file.name, embedded_file.pdf_object))
+        associated_entries: list[DictionaryObject] = []
+        if has_associated_files:
+            associated_files = src_root["/AF"]
+            if not isinstance(associated_files, ArrayObject):
+                raise PdfReadError(
+                    "Cannot migrate associated files: "
+                    f"/AF is not an array: {associated_files!r}"
+                )
+            for entry in associated_files:
+                filespec = entry.get_object()
+                if not isinstance(filespec, DictionaryObject):
+                    raise PdfReadError(
+                        "Cannot migrate associated file: "
+                        "the referenced file specification cannot be resolved"
+                    )
+                associated_entries.append(filespec)
+
+        # Names already present in the target document (from previously added
+        # or merged attachments). Conflicts are only handled across source
+        # document boundaries, so this snapshot is kept unchanged while
+        # importing: entries of one and the same source document are always
+        # preserved as they are.
+        existing_names = {
+            embedded_file.name
+            for embedded_file in EmbeddedFile._load(self._root_object)
+        }
+        target_af = self._get_catalog_af(create=False)
+        if target_af is not None:
+            for entry in target_af:
+                filespec = entry.get_object() if isinstance(entry, IndirectObject) else entry
+                if isinstance(filespec, DictionaryObject):
+                    name = self._filespec_display_name(filespec)
+                    if name is not None:
+                        existing_names.add(name)
+
+        used_names = set(existing_names)
+        replaced_names: set[str] = set()
+        rejected_idnums: set[int] = set()
+        handled_idnums: set[int] = set()
+        cloned_filespecs: dict[int, DictionaryObject] = {}
+
+        def clone_filespec(filespec: DictionaryObject) -> DictionaryObject:
+            # Clone each source file specification only once: indirect objects
+            # are additionally shared through the regular clone translation
+            # (with page and annotation references), direct dictionaries
+            # through this cache.
+            key = id(filespec)
+            if key not in cloned_filespecs:
+                cloned = filespec.clone(self)
+                if getattr(cloned, "indirect_reference", None) is None:
+                    # A direct dictionary in the source: register the clone.
+                    self._add_object(cloned)
+                cloned_filespecs[key] = cloned
+            return cloned_filespecs[key]
+
+        for name, filespec in name_entries:
+            src_reference = getattr(filespec, "indirect_reference", None)
+            if src_reference is not None:
+                handled_idnums.add(src_reference.idnum)
+            final_name = self._resolve_attachment_name_conflict(
+                name, existing_names, used_names, replaced_names, attachment_conflicts
+            )
+            if final_name is None:
+                if src_reference is not None:
+                    rejected_idnums.add(src_reference.idnum)
+                continue
+            used_names.add(final_name)
+            cloned = clone_filespec(filespec)
+            assert cloned.indirect_reference is not None
+            if final_name != name:
+                # Keep the (shared) file specification consistent with the
+                # new name tree key.
+                cloned[NameObject("/UF")] = TextStringObject(final_name)
+                if "/F" in cloned:
+                    cloned[NameObject("/F")] = TextStringObject(final_name)
+            names_array = EmbeddedFile._get_names_array(self)
+            insertion_index = EmbeddedFile._get_insertion_index(names_array, final_name)
+            names_array.insert(insertion_index, cloned.indirect_reference)
+            names_array.insert(insertion_index, TextStringObject(final_name))
+
+        for filespec in associated_entries:
+            src_reference = getattr(filespec, "indirect_reference", None)
+            if src_reference is not None and src_reference.idnum in rejected_idnums:
+                continue
+            if src_reference is None or src_reference.idnum not in handled_idnums:
+                # Not imported through the name tree: apply the conflict
+                # strategy on the file specification's own name.
+                name = self._filespec_display_name(filespec)
+                final_name = self._resolve_attachment_name_conflict(
+                    name, existing_names, used_names, replaced_names, attachment_conflicts
+                )
+                if final_name is None:
+                    if src_reference is not None:
+                        rejected_idnums.add(src_reference.idnum)
+                    continue
+                if final_name is not None:
+                    used_names.add(final_name)
+                    if final_name != name:
+                        cloned = clone_filespec(filespec)
+                        cloned[NameObject("/UF")] = TextStringObject(final_name)
+                        if "/F" in cloned:
+                            cloned[NameObject("/F")] = TextStringObject(final_name)
+            cloned = clone_filespec(filespec)
+            assert cloned.indirect_reference is not None
+            self._append_catalog_af(cloned.indirect_reference)
+
+    def _resolve_attachment_name_conflict(
+        self,
+        name: Optional[str],
+        existing_names: set[str],
+        used_names: set[str],
+        replaced_names: set[str],
+        attachment_conflicts: str,
+    ) -> Optional[str]:
+        """
+        Apply the conflict strategy for an imported attachment name.
+
+        Returns:
+            The name to use for the imported attachment,
+            or None if the attachment must be rejected.
+
+        """
+        if name is None or name not in existing_names:
+            return name
+        if attachment_conflicts == "reject":
+            return None
+        if attachment_conflicts == "replace":
+            if name not in replaced_names:
+                self._remove_target_attachment_entries(name)
+                replaced_names.add(name)
+            return name
+        if attachment_conflicts == "rename":
+            return self._unique_attachment_name(name, used_names)
+        return name  # "keep"
+
+    @staticmethod
+    def _unique_attachment_name(name: str, used_names: set[str]) -> str:
+        """Return a ``"name (2).ext"``-style variant of name that is not in used_names."""
+        stem, dot, extension = name.rpartition(".")
+        if not dot or not stem:
+            stem, extension = name, ""
+        else:
+            extension = f".{extension}"
+        counter = 2
+        candidate = f"{stem} ({counter}){extension}"
+        while candidate in used_names:
+            counter += 1
+            candidate = f"{stem} ({counter}){extension}"
+        return candidate
+
+    @staticmethod
+    def _filespec_display_name(filespec: DictionaryObject) -> Optional[str]:
+        """Return the display name (``/UF`` preferred over ``/F``) of a file specification."""
+        for key in ("/UF", "/F"):
+            value = filespec.get(key)
+            if isinstance(value, PdfObject):
+                value = value.get_object()
+            if isinstance(value, str) and len(value) > 0:
+                return str(value)
+        return None
+
+    def _get_catalog_af(self, create: bool = False) -> Optional[ArrayObject]:
+        """Return the catalog ``/AF`` array of this writer, optionally creating it."""
+        associated = self._root_object.get("/AF")
+        if isinstance(associated, IndirectObject):
+            associated = associated.get_object()
+        if associated is None:
+            if not create:
+                return None
+            associated = ArrayObject()
+            self._root_object[NameObject("/AF")] = associated
+        if not isinstance(associated, ArrayObject):
+            return None
+        return associated
+
+    def _append_catalog_af(self, filespec_reference: IndirectObject) -> None:
+        """Append a file specification reference to the catalog ``/AF`` array (deduplicated)."""
+        associated = self._get_catalog_af(create=True)
+        if associated is None:
+            raise PdfReadError(
+                "Cannot migrate associated files: "
+                "the target catalog /AF entry is not an array"
+            )
+        for entry in associated:
+            if isinstance(entry, IndirectObject):
+                if (
+                    entry.idnum == filespec_reference.idnum
+                    and entry.generation == filespec_reference.generation
+                ):
+                    return
+            elif entry is filespec_reference.get_object():
+                return
+        associated.append(filespec_reference)
+
+    def _remove_target_attachment_entries(self, name: str) -> None:
+        """Remove all entries with name from the EmbeddedFiles name tree and the catalog ``/AF`` array."""
+        names_dict = self._root_object.get("/Names")
+        if isinstance(names_dict, IndirectObject):
+            names_dict = names_dict.get_object()
+        if isinstance(names_dict, DictionaryObject) and "/EmbeddedFiles" in names_dict:
+            names_array = EmbeddedFile._get_names_array(self)
+            index = 0
+            while index + 1 < len(names_array):
+                key = names_array[index]
+                if isinstance(key, IndirectObject):
+                    key = key.get_object()
+                if key == name:
+                    del names_array[index:index + 2]
+                else:
+                    index += 2
+        associated = self._get_catalog_af(create=False)
+        if associated is not None:
+            kept = ArrayObject()
+            for entry in associated:
+                filespec = entry.get_object() if isinstance(entry, IndirectObject) else entry
+                if not (
+                    isinstance(filespec, DictionaryObject)
+                    and self._filespec_display_name(filespec) == name
+                ):
+                    kept.append(entry)
+            if len(kept) != len(associated):
+                associated[:] = kept
 
     def _merge__process_named_dests(self, dest: Any, reader: PdfDocCommon, srcpages: dict[int, PageObject]) -> None:
         arr: Any = dest.dest_array

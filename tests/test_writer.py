@@ -3,6 +3,7 @@
 import re
 import shutil
 import subprocess
+from datetime import datetime
 from io import BytesIO
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -1741,6 +1742,238 @@ def test_attachments():
 
     # The content for foobar2.txt is a list with different values.
     assert att["foobar2.txt"] == [b"foobarcontent2", b"2nd_foobarcontent"]
+
+
+def _make_attachment_source(
+    name="shared.txt",
+    content=b"content",
+    *,
+    annotation=False,
+    page_af=False,
+    catalog_af=False,
+    struct_af=False,
+    relationship=None,
+):
+    """Build an in-memory PDF with one attachment referenced as requested."""
+    writer = PdfWriter()
+    page = writer.add_blank_page(100, 100)
+    embedded_file = writer.add_attachment(name, content)
+    filespec_reference = embedded_file.pdf_object.indirect_reference
+    if relationship is not None:
+        embedded_file.associated_file_relationship = NameObject(relationship)
+    if annotation:
+        annot = DictionaryObject()
+        annot[NameObject("/Type")] = NameObject("/Annot")
+        annot[NameObject("/Subtype")] = NameObject("/FileAttachment")
+        annot[NameObject("/Rect")] = RectangleObject([0, 0, 10, 10])
+        annot[NameObject("/FS")] = filespec_reference
+        writer.add_annotation(0, annot)
+    if page_af:
+        page[NameObject("/AF")] = ArrayObject([filespec_reference])
+    if catalog_af:
+        writer._root_object[NameObject("/AF")] = ArrayObject([filespec_reference])
+    if struct_af:
+        struct_element = DictionaryObject()
+        struct_element[NameObject("/Type")] = NameObject("/StructElem")
+        struct_element[NameObject("/S")] = NameObject("/Figure")
+        struct_element[NameObject("/AF")] = ArrayObject([filespec_reference])
+        struct_tree = DictionaryObject()
+        struct_tree[NameObject("/Type")] = NameObject("/StructTreeRoot")
+        struct_tree[NameObject("/K")] = writer._add_object(struct_element)
+        writer._root_object[NameObject("/StructTreeRoot")] = writer._add_object(struct_tree)
+    stream = BytesIO()
+    writer.write(stream)
+    stream.seek(0)
+    return stream
+
+
+def test_merge_attachments_from_page_catalog_and_structure_references():
+    # Attachments referenced from a page annotation, the catalog /AF array and
+    # a structure element are all preserved when merging; same-name files from
+    # different sources are kept as separate objects by default.
+    writer = PdfWriter()
+    writer.add_attachment("existing.txt", b"existing-content")
+    writer.append(_make_attachment_source(content=b"page-content", annotation=True, page_af=True))
+    writer.append(_make_attachment_source(content=b"catalog-content", catalog_af=True, relationship="/Source"))
+    writer.append(_make_attachment_source(content=b"struct-content", struct_af=True))
+    stream = BytesIO()
+    writer.write(stream)
+    stream.seek(0)
+    reader = PdfReader(stream)
+
+    # The target's own attachment is untouched and all three same-name
+    # attachments are preserved separately.
+    assert reader.attachments["existing.txt"] == [b"existing-content"]
+    assert reader.attachments["shared.txt"] == [b"page-content", b"catalog-content", b"struct-content"]
+
+    entries = [entry for entry in reader.attachment_list if entry.name == "shared.txt"]
+    assert len(entries) == 3
+    idnums = [entry.pdf_object.indirect_reference.idnum for entry in entries]
+    assert len(set(idnums)) == 3
+
+    # The catalog /AF array references the second source's file specification,
+    # which is the same object as the corresponding name tree entry.
+    catalog_af = reader.root_object["/AF"]
+    assert len(catalog_af) == 1
+    af_filespec = catalog_af[0].get_object()
+    assert af_filespec.indirect_reference.idnum == idnums[1]
+    assert af_filespec["/AFRelationship"] == "/Source"
+
+    # The page annotation and the page /AF of the first merged page reference
+    # the same object as the first name tree entry.
+    annot = reader.pages[0]["/Annots"][0].get_object()
+    assert annot["/Subtype"] == "/FileAttachment"
+    assert annot["/FS"].get_object().indirect_reference.idnum == idnums[0]
+    page_af = reader.pages[0]["/AF"]
+    assert page_af[0].get_object().indirect_reference.idnum == idnums[0]
+
+    # Deleting one attachment does not affect the other same-name objects.
+    entries[1].delete()
+    assert reader.attachments["shared.txt"] == [b"page-content", b"struct-content"]
+    assert [entry.content for entry in reader.attachment_list if entry.name == "shared.txt"] == [
+        b"page-content",
+        b"struct-content",
+    ]
+    # The catalog /AF reference still resolves to the detached file specification.
+    af_filespec = reader.root_object["/AF"][0].get_object()
+    assert af_filespec["/EF"]["/F"].get_object().get_data() == b"catalog-content"
+
+
+@pytest.mark.parametrize(
+    ("strategy", "expected_attachments", "expected_af_count"),
+    [
+        ("keep", {"shared.txt": [b"original", b"incoming"]}, 1),
+        ("rename", {"shared.txt": [b"original"], "shared (2).txt": [b"incoming"]}, 1),
+        ("reject", {"shared.txt": [b"original"]}, 0),
+        ("replace", {"shared.txt": [b"incoming"]}, 1),
+    ],
+)
+def test_merge_attachments_conflict_strategies(strategy, expected_attachments, expected_af_count):
+    writer = PdfWriter()
+    writer.add_blank_page(100, 100)
+    writer.add_attachment("shared.txt", b"original")
+    writer.append(
+        _make_attachment_source(content=b"incoming", catalog_af=True),
+        attachment_conflicts=strategy,
+    )
+    stream = BytesIO()
+    writer.write(stream)
+    stream.seek(0)
+    reader = PdfReader(stream)
+    assert dict(reader.attachments) == expected_attachments
+    assert len(reader.root_object.get("/AF", [])) == expected_af_count
+    if strategy == "rename":
+        renamed = [entry for entry in reader.attachment_list if entry.name == "shared (2).txt"]
+        assert len(renamed) == 1
+        assert renamed[0].alternative_name == "shared (2).txt"
+
+
+def test_merge_attachments_invalid_conflict_strategy():
+    writer = PdfWriter()
+    with pytest.raises(ValueError, match="attachment_conflicts"):
+        writer.append(_make_attachment_source(), attachment_conflicts="invalid")
+
+
+def test_merge_attachments_import_disabled():
+    writer = PdfWriter()
+    writer.append(_make_attachment_source(catalog_af=True), import_attachments=False)
+    stream = BytesIO()
+    writer.write(stream)
+    stream.seek(0)
+    reader = PdfReader(stream)
+    assert reader.attachments == {}
+    assert "/AF" not in reader.root_object
+
+
+def test_merge_without_attachments_keeps_output_bytes():
+    # Documents without attachments keep the historical code path and
+    # byte-identical output, independently of import_attachments.
+    src = BytesIO()
+    writer = PdfWriter()
+    writer.add_blank_page(100, 100)
+    writer.write(src)
+    src_bytes = src.getvalue()
+
+    outputs = []
+    for import_attachments in (True, False):
+        writer = PdfWriter()
+        writer.append(BytesIO(src_bytes), import_attachments=import_attachments)
+        out = BytesIO()
+        writer.write(out)
+        outputs.append(out.getvalue())
+    assert outputs[0] == outputs[1]
+
+
+def test_merge_attachments_preserves_names_params_and_relationship():
+    writer = PdfWriter()
+    writer.add_blank_page(100, 100)
+    unicode_file = writer.add_attachment("h\u00e9llo w\u00f6rld.txt", b"unicode-content")
+    unicode_file.associated_file_relationship = NameObject("/Data")
+    unicode_file.size = NumberObject(14)
+    unicode_file.modification_date = datetime(2020, 1, 2, 3, 4, 5)
+    writer.add_attachment("sub/dir/report.txt", b"relative-content")
+    src = BytesIO()
+    writer.write(src)
+    src.seek(0)
+
+    merged = PdfWriter()
+    merged.append(src)
+    out = BytesIO()
+    merged.write(out)
+    out.seek(0)
+    reader = PdfReader(out)
+    assert reader.attachments["h\u00e9llo w\u00f6rld.txt"] == [b"unicode-content"]
+    assert reader.attachments["sub/dir/report.txt"] == [b"relative-content"]
+    by_name = {entry.name: entry for entry in reader.attachment_list}
+    assert by_name["h\u00e9llo w\u00f6rld.txt"].associated_file_relationship == "/Data"
+    assert by_name["h\u00e9llo w\u00f6rld.txt"].size == 14
+    assert by_name["h\u00e9llo w\u00f6rld.txt"].modification_date == datetime(2020, 1, 2, 3, 4, 5)
+
+
+def test_merge_attachments_from_encrypted_source():
+    encrypting_writer = PdfWriter()
+    encrypting_writer.append(_make_attachment_source(name="secret.txt", content=b"secret-content"))
+    encrypting_writer.encrypt("password")
+    encrypted = BytesIO()
+    encrypting_writer.write(encrypted)
+    encrypted.seek(0)
+
+    reader = PdfReader(encrypted)
+    reader.decrypt("password")
+    writer = PdfWriter()
+    writer.append(reader)
+    out = BytesIO()
+    writer.write(out)
+    out.seek(0)
+    assert PdfReader(out).attachments["secret.txt"] == [b"secret-content"]
+
+
+def test_merge_attachments_unresolvable_reference_raises():
+    # A dangling reference in the catalog /AF array.
+    writer = PdfWriter()
+    writer.add_blank_page(100, 100)
+    writer._root_object[NameObject("/AF")] = ArrayObject([IndirectObject(999, 0, writer)])
+    src = BytesIO()
+    writer.write(src)
+    src.seek(0)
+    with pytest.raises(PdfReadError, match="Cannot migrate associated file"):
+        PdfWriter().append(src)
+
+    # A name tree entry that does not reference a file specification.
+    writer = PdfWriter()
+    writer.add_blank_page(100, 100)
+    writer._root_object[NameObject("/Names")] = DictionaryObject(
+        {
+            NameObject("/EmbeddedFiles"): DictionaryObject(
+                {NameObject("/Names"): ArrayObject([TextStringObject("bad.txt"), NumberObject(5)])}
+            )
+        }
+    )
+    src = BytesIO()
+    writer.write(src)
+    src.seek(0)
+    with pytest.raises(PdfReadError, match="Cannot migrate attachment"):
+        PdfWriter().append(src)
 
 
 @pytest.mark.enable_socket

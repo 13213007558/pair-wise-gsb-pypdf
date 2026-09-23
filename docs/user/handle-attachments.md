@@ -83,6 +83,21 @@ writer.write("out-add-attachment.pdf")
 The same functionality is available if you iterate over the attachments of a writer
 using `writer.attachment_list`.
 
+## Merge Attachments
+
+When merging documents with {py:meth}`PdfWriter.append <pypdf.PdfWriter.append>`
+or {py:meth}`PdfWriter.merge <pypdf.PdfWriter.merge>`, the attachments of the
+source document are imported by default: the embedded files name tree and the
+catalog `/AF` array are migrated, and references from pages or annotations
+keep pointing to the same (shared) file specification object. This can be
+disabled with `import_attachments=False`.
+
+If an imported attachment has the same name as an existing one, both are kept
+separately by default. The `attachment_conflicts` parameter controls how such
+conflicts are handled: `"keep"` (default) preserves both attachments,
+`"rename"` renames the imported attachment, `"reject"` skips the imported
+attachment and `"replace"` replaces the existing attachment.
+
 ## Delete Attachments
 
 To delete an existing attachment, use the following code:

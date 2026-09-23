@@ -2745,6 +2745,12 @@ class PdfWriter(PdfDocCommon):
                 if ``/Annots`` is part of the list, the annotation will be ignored
                 if ``/B`` is part of the list, the articles will be ignored
 
+        The source document's optional content (layers) is preserved: the
+        ``/OCGs`` array and the default configuration (``/D``) of the
+        source's ``/OCProperties`` are merged into the output document, unless
+        ``/OCProperties`` is part of ``excluded_fields``. Named configurations
+        (``/Configs``) are not imported.
+
         Raises:
             TypeError: The pages attribute is not configured properly
 
@@ -2872,6 +2878,229 @@ class PdfWriter(PdfDocCommon):
 
         if "/B" not in excluded_fields:
             self.add_filtered_articles("", srcpages, reader)
+
+        if "/OCProperties" not in excluded_fields:
+            self._merge_optional_content(reader)
+
+    @staticmethod
+    def _ocg_idnum(obj: Any) -> Optional[int]:
+        """Return the idnum of an (possibly indirect) object, None if direct."""
+        if isinstance(obj, IndirectObject):
+            return obj.idnum
+        ref = getattr(obj, "indirect_reference", None)
+        return ref.idnum if ref is not None else None
+
+    def _collect_ocg_idnums(self, items: Any, acc: set[int]) -> None:
+        """Collect the idnums of all OCG references within an /Order tree."""
+        for item in items:
+            if isinstance(item, ArrayObject):
+                self._collect_ocg_idnums(item, acc)
+            elif isinstance(item, (IndirectObject, DictionaryObject)):
+                idnum = self._ocg_idnum(item)
+                if idnum is not None:
+                    acc.add(idnum)
+
+    def _filter_ocg_order(self, items: Any, used: set[int]) -> Optional[ArrayObject]:
+        """
+        Filter an /Order tree, dropping OCG references already in ``used``.
+
+        Group labels are preserved for groups that still contain members.
+        Returns None if nothing remains.
+        """
+        kept: list[Any] = []
+        labels: list[Any] = []
+        for item in items:
+            if isinstance(item, ArrayObject):
+                sub = self._filter_ocg_order(item, used)
+                if sub is not None:
+                    kept.append(sub)
+            elif isinstance(item, (IndirectObject, DictionaryObject)):
+                idnum = self._ocg_idnum(item)
+                if idnum is None or idnum not in used:
+                    if idnum is not None:
+                        used.add(idnum)
+                    kept.append(item)
+            else:
+                labels.append(item)
+        if not kept:
+            return None
+        result = ArrayObject()
+        result.extend(labels)
+        result.extend(kept)
+        return result
+
+    def _merge_optional_content(self, reader: PdfDocCommon) -> None:
+        """
+        Merge the optional content (layer) properties of ``reader`` into the
+        writer's catalog.
+
+        The ``/OCGs`` array and the default configuration (``/D``: ``/ON``,
+        ``/OFF``, ``/Order``, ``/RBGroups``, ``/Locked``) of the source are
+        merged into the writer's ``/OCProperties``. OCGs already cloned
+        through the imported pages are reused, so ``/OC`` references in
+        content streams, XObjects and annotations keep pointing to the
+        correct layer objects; layers from different source documents stay
+        distinct even if they share the same name. Existing entries of the
+        writer's configuration are never overwritten. Named configurations
+        (``/Configs``) are not imported.
+        """
+        src_ocp = reader.root_object.get(CatalogAttributes.OC_PROPERTIES)
+        if src_ocp is None:
+            return
+        src_ocp = src_ocp.get_object()
+        if not isinstance(src_ocp, DictionaryObject):
+            return
+        if "/Configs" in src_ocp:
+            logger_warning(
+                "Named optional content configurations (/Configs) are not "
+                "imported; only the default configuration (/D) is merged.",
+                source=__name__,
+            )
+        src_ocgs = src_ocp.get("/OCGs", [])
+        if isinstance(src_ocgs, IndirectObject):
+            src_ocgs = src_ocgs.get_object()
+        src_d = src_ocp.get("/D")
+        if src_d is not None:
+            src_d = src_d.get_object()
+        if not src_ocgs and not isinstance(src_d, DictionaryObject):
+            return
+
+        dst_ocp = self._root_object.get(NameObject(CatalogAttributes.OC_PROPERTIES))
+        if dst_ocp is None:
+            dst_ocp = DictionaryObject()
+            self._root_object[NameObject(CatalogAttributes.OC_PROPERTIES)] = dst_ocp
+        else:
+            dst_ocp = dst_ocp.get_object()
+            if not isinstance(dst_ocp, DictionaryObject):
+                return
+        dst_ocgs = dst_ocp.get(NameObject("/OCGs"))
+        if dst_ocgs is None:
+            dst_ocgs = ArrayObject()
+            dst_ocp[NameObject("/OCGs")] = dst_ocgs
+        else:
+            dst_ocgs = dst_ocgs.get_object()
+
+        def _clone_ref(obj: Any) -> Any:
+            cloned = obj.clone(self) if hasattr(obj, "clone") else obj
+            if not isinstance(obj, IndirectObject):
+                ref = getattr(cloned, "indirect_reference", None)
+                if ref is not None:
+                    return ref
+            return cloned
+
+        present = {
+            idnum
+            for idnum in (self._ocg_idnum(o) for o in dst_ocgs)
+            if idnum is not None
+        }
+        for ocg in src_ocgs:
+            cloned = _clone_ref(ocg)
+            idnum = self._ocg_idnum(cloned)
+            if idnum is None or idnum not in present:
+                if idnum is not None:
+                    present.add(idnum)
+                dst_ocgs.append(cloned)
+
+        if not isinstance(src_d, DictionaryObject):
+            return
+        dst_d = dst_ocp.get(NameObject("/D"))
+        if dst_d is None:
+            dst_ocp[NameObject("/D")] = src_d.clone(self)
+            return
+        dst_d = dst_d.get_object()
+        if not isinstance(dst_d, DictionaryObject):
+            return
+
+        for key in ("/BaseState", "/ListMode"):
+            if key not in dst_d and key in src_d:
+                value = src_d[key]
+                dst_d[NameObject(key)] = (
+                    value.clone(self) if hasattr(value, "clone") else value
+                )
+
+        for key in ("/ON", "/OFF", "/Locked"):
+            src_arr = src_d.get(key)
+            if src_arr is None:
+                continue
+            src_arr = src_arr.get_object()
+            if not isinstance(src_arr, ArrayObject):
+                continue
+            dst_arr = dst_d.get(NameObject(key))
+            if dst_arr is None:
+                dst_d[NameObject(key)] = src_arr.clone(self)
+                continue
+            dst_arr = dst_arr.get_object()
+            if not isinstance(dst_arr, ArrayObject):
+                continue
+            present = {
+                idnum
+                for idnum in (self._ocg_idnum(o) for o in dst_arr)
+                if idnum is not None
+            }
+            for ocg in src_arr:
+                cloned = _clone_ref(ocg)
+                idnum = self._ocg_idnum(cloned)
+                if idnum is None or idnum not in present:
+                    if idnum is not None:
+                        present.add(idnum)
+                    dst_arr.append(cloned)
+
+        src_rb = src_d.get("/RBGroups")
+        if src_rb is not None:
+            src_rb = src_rb.get_object()
+            if isinstance(src_rb, ArrayObject):
+                dst_rb = dst_d.get(NameObject("/RBGroups"))
+                if dst_rb is None:
+                    dst_d[NameObject("/RBGroups")] = src_rb.clone(self)
+                else:
+                    dst_rb = dst_rb.get_object()
+                    if isinstance(dst_rb, ArrayObject):
+                        existing = [
+                            {
+                                idnum
+                                for idnum in (
+                                    self._ocg_idnum(m) for m in grp.get_object()
+                                )
+                                if idnum is not None
+                            }
+                            for grp in dst_rb
+                            if isinstance(grp.get_object(), ArrayObject)
+                        ]
+                        for grp in src_rb:
+                            cloned_grp = _clone_ref(grp)
+                            grp_obj = (
+                                cloned_grp.get_object()
+                                if isinstance(cloned_grp, IndirectObject)
+                                else cloned_grp
+                            )
+                            members = {
+                                idnum
+                                for idnum in (
+                                    self._ocg_idnum(m) for m in grp_obj
+                                )
+                                if idnum is not None
+                            }
+                            if members not in existing:
+                                existing.append(members)
+                                dst_rb.append(cloned_grp)
+
+        src_order = src_d.get("/Order")
+        if src_order is not None:
+            src_order = src_order.get_object()
+            if isinstance(src_order, ArrayObject):
+                dst_order = dst_d.get(NameObject("/Order"))
+                if dst_order is None:
+                    dst_d[NameObject("/Order")] = src_order.clone(self)
+                else:
+                    dst_order = dst_order.get_object()
+                    if isinstance(dst_order, ArrayObject):
+                        used: set[int] = set()
+                        self._collect_ocg_idnums(dst_order, used)
+                        filtered = self._filter_ocg_order(
+                            src_order.clone(self), used
+                        )
+                        if filtered is not None:
+                            dst_order.extend(filtered)
 
     def _merge__process_named_dests(self, dest: Any, reader: PdfDocCommon, srcpages: dict[int, PageObject]) -> None:
         arr: Any = dest.dest_array

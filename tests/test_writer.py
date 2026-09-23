@@ -3868,3 +3868,247 @@ def test_update_page_form_field_values__skips_unannotated_page_in_list(caplog):
         r for r in caplog.records
         if r.levelname == "WARNING"
     ]
+
+
+def _create_layered_pdf(
+    layer_name="Notes",
+    *,
+    with_ocmd=False,
+    second_page_sharing_layer=False,
+    with_named_config=False,
+    base_state="/ON",
+):
+    """Create a PDF whose page references an optional content group (layer)
+    from marked content, an XObject and an annotation."""
+    writer = PdfWriter()
+    page = writer.add_blank_page(width=100, height=100)
+    ocg = writer._add_object(
+        DictionaryObject({
+            NameObject("/Type"): NameObject("/OCG"),
+            NameObject("/Name"): TextStringObject(layer_name),
+        })
+    )
+    properties = DictionaryObject({NameObject("/Notes"): ocg})
+    content_data = b"/OC /Notes BDC 0 0 10 10 re f EMC"
+    if with_ocmd:
+        ocmd = writer._add_object(
+            DictionaryObject({
+                NameObject("/Type"): NameObject("/OCMD"),
+                NameObject("/OCGs"): ArrayObject([ocg]),
+                NameObject("/VE"): ArrayObject([NameObject("/And"), ocg]),
+            })
+        )
+        properties[NameObject("/OCMD1")] = ocmd
+        content_data += b" /OC /OCMD1 BDC 1 1 5 5 re f EMC"
+    xobject = DecodedStreamObject()
+    xobject.set_data(b"0 0 5 5 re f")
+    xobject[NameObject("/Type")] = NameObject("/XObject")
+    xobject[NameObject("/Subtype")] = NameObject("/Form")
+    xobject[NameObject("/BBox")] = ArrayObject(
+        [NumberObject(0), NumberObject(0), NumberObject(5), NumberObject(5)]
+    )
+    xobject[NameObject("/OC")] = ocg
+    page[NameObject("/Resources")] = DictionaryObject({
+        NameObject("/Properties"): properties,
+        NameObject("/XObject"): DictionaryObject(
+            {NameObject("/Fm1"): writer._add_object(xobject)}
+        ),
+    })
+    content = DecodedStreamObject()
+    content.set_data(content_data + b" /Fm1 Do")
+    page[NameObject("/Contents")] = writer._add_object(content)
+    page[NameObject("/Annots")] = ArrayObject([
+        writer._add_object(
+            DictionaryObject({
+                NameObject("/Type"): NameObject("/Annot"),
+                NameObject("/Subtype"): NameObject("/Text"),
+                NameObject("/Rect"): RectangleObject([0, 0, 10, 10]),
+                NameObject("/Contents"): TextStringObject("annotation"),
+                NameObject("/OC"): ocg,
+            })
+        )
+    ])
+    if second_page_sharing_layer:
+        second_page = writer.add_blank_page(width=100, height=100)
+        second_page[NameObject("/Resources")] = DictionaryObject({
+            NameObject("/Properties"): DictionaryObject({NameObject("/Notes"): ocg})
+        })
+    oc_properties = DictionaryObject({
+        NameObject("/OCGs"): ArrayObject([ocg]),
+        NameObject("/D"): DictionaryObject({
+            NameObject("/BaseState"): NameObject(base_state),
+            NameObject("/ON"): ArrayObject([ocg]),
+            NameObject("/OFF"): ArrayObject(),
+            NameObject("/Order"): ArrayObject([
+                ArrayObject([TextStringObject("Group"), ocg])
+            ]),
+            NameObject("/RBGroups"): ArrayObject([ArrayObject([ocg])]),
+            NameObject("/Locked"): ArrayObject([ocg]),
+        }),
+    })
+    if with_named_config:
+        oc_properties[NameObject("/Configs")] = ArrayObject([
+            DictionaryObject({
+                NameObject("/Name"): TextStringObject("Alternative"),
+                NameObject("/OFF"): ArrayObject([ocg]),
+            })
+        ])
+    writer._root_object[NameObject("/OCProperties")] = writer._add_object(
+        oc_properties
+    )
+    stream = BytesIO()
+    writer.write(stream)
+    stream.seek(0)
+    return stream
+
+
+def test_append_preserves_optional_content_layers():
+    """Layers from two documents keep separate objects even when they share
+    their display name, and page references keep pointing to the layer of
+    their own source document."""
+    writer = PdfWriter()
+    writer.append(_create_layered_pdf("Notes", with_ocmd=True))
+    writer.append(_create_layered_pdf("Notes", with_ocmd=True))
+
+    oc_properties = writer.root_object["/OCProperties"]
+    ocgs = oc_properties["/OCGs"]
+    assert len(ocgs) == 2
+    first_ocg, second_ocg = ocgs
+    assert first_ocg != second_ocg
+    assert first_ocg.get_object()["/Name"] == "Notes"
+    assert second_ocg.get_object()["/Name"] == "Notes"
+
+    default = oc_properties["/D"]
+    assert len(default["/ON"]) == 2
+    assert len(default["/OFF"]) == 0
+    assert len(default["/Order"]) == 2  # nested groups of both sources
+    assert len(default["/RBGroups"]) == 2
+    assert len(default["/Locked"]) == 2
+
+    first_page, second_page = writer.pages
+    first_properties = first_page["/Resources"]["/Properties"]
+    second_properties = second_page["/Resources"]["/Properties"]
+    # marked-content reference (/OC /Notes BDC in the content stream)
+    assert first_properties.raw_get("/Notes") == first_ocg
+    assert second_properties.raw_get("/Notes") == second_ocg
+    # XObject reference
+    first_xobject = first_page["/Resources"]["/XObject"]["/Fm1"]
+    second_xobject = second_page["/Resources"]["/XObject"]["/Fm1"]
+    assert first_xobject.raw_get("/OC") == first_ocg
+    assert second_xobject.raw_get("/OC") == second_ocg
+    # annotation reference
+    assert first_page["/Annots"][0].raw_get("/OC") == first_ocg
+    assert second_page["/Annots"][0].raw_get("/OC") == second_ocg
+
+    # Turning off one "Notes" layer does not affect the other document's one.
+    default["/ON"].remove(first_ocg)
+    default["/OFF"].append(first_ocg)
+    assert second_ocg in default["/ON"]
+    assert second_ocg not in default["/OFF"]
+    assert second_properties.raw_get("/Notes") == second_ocg
+
+
+def test_append_maps_ocmd_references_to_target_objects():
+    writer = PdfWriter()
+    writer.append(_create_layered_pdf(with_ocmd=True))
+
+    ocg = writer.root_object["/OCProperties"]["/OCGs"][0]
+    properties = writer.pages[0]["/Resources"]["/Properties"]
+    ocmd_ref = properties.raw_get("/OCMD1")
+    assert ocmd_ref.pdf is writer
+    ocmd = ocmd_ref.get_object()
+    assert ocmd["/OCGs"][0] == ocg  # membership dictionary
+    assert ocmd["/VE"][1] == ocg  # visibility expression
+
+
+def test_append_keeps_layer_shared_between_pages_of_one_source():
+    writer = PdfWriter()
+    writer.append(_create_layered_pdf(second_page_sharing_layer=True))
+
+    ocgs = writer.root_object["/OCProperties"]["/OCGs"]
+    assert len(ocgs) == 1
+    first = writer.pages[0]["/Resources"]["/Properties"].raw_get("/Notes")
+    second = writer.pages[1]["/Resources"]["/Properties"].raw_get("/Notes")
+    assert first == second == ocgs[0]
+
+
+def test_append_does_not_overwrite_existing_oc_configuration(caplog):
+    writer = PdfWriter()
+    writer.append(_create_layered_pdf("Notes", base_state="/OFF"))
+    writer.append(_create_layered_pdf("Notes", base_state="/ON", with_named_config=True))
+
+    oc_properties = writer.root_object["/OCProperties"]
+    default = oc_properties["/D"]
+    # The existing configuration is not overwritten by the second document.
+    assert default["/BaseState"] == "/OFF"
+    assert len(default["/ON"]) == 2
+    assert len(default["/Locked"]) == 2
+    # Named configurations are not imported.
+    assert "/Configs" not in oc_properties
+    assert "Named optional content configurations" in caplog.text
+
+
+def test_append_oc_properties_written_objects_belong_to_target_document():
+    writer = PdfWriter()
+    writer.append(_create_layered_pdf("Notes", with_ocmd=True))
+    writer.append(_create_layered_pdf("Notes", with_ocmd=True))
+    stream = BytesIO()
+    writer.write(stream)
+    stream.seek(0)
+    reader = PdfReader(stream)
+
+    seen = set()
+
+    def check_indirect_objects(obj):
+        if isinstance(obj, IndirectObject):
+            assert obj.pdf is reader
+            key = (obj.idnum, obj.generation)
+            if key not in seen:
+                seen.add(key)
+                check_indirect_objects(obj.get_object())
+        elif isinstance(obj, DictionaryObject):
+            for value in obj.values():
+                check_indirect_objects(value)
+        elif isinstance(obj, ArrayObject):
+            for value in obj:
+                check_indirect_objects(value)
+
+    check_indirect_objects(reader.root_object.raw_get("/OCProperties"))
+    assert len(seen) == 3  # /OCProperties + one OCG per source document
+    page_layer = reader.pages[0]["/Resources"]["/Properties"].raw_get("/Notes")
+    assert page_layer.pdf is reader
+
+
+def test_append_without_oc_properties_keeps_previous_behavior():
+    source = PdfWriter()
+    source.add_blank_page(width=72, height=72)
+    stream = BytesIO()
+    source.write(stream)
+    stream.seek(0)
+
+    writer = PdfWriter()
+    writer.append(stream)
+    assert "/OCProperties" not in writer.root_object
+
+
+def test_append_merges_oc_properties_of_real_documents():
+    writer = PdfWriter()
+    writer.append(RESOURCE_ROOT / "AutoCad_Simple.pdf")
+    writer.append(RESOURCE_ROOT / "AutoCad_Diagram.pdf")
+
+    oc_properties = writer.root_object["/OCProperties"]
+    ocgs = oc_properties["/OCGs"]
+    assert len(ocgs) == 6
+    names = [ocg.get_object()["/Name"] for ocg in ocgs]
+    assert "DIMENSION" in names
+    assert "Visible Edges(ISO)" in names
+    default = oc_properties["/D"]
+    assert len(default["/Order"]) == 6
+    for ocg in ocgs:
+        assert ocg.pdf is writer
+
+    stream = BytesIO()
+    writer.write(stream)
+    stream.seek(0)
+    reader = PdfReader(stream)
+    assert len(reader.root_object["/OCProperties"]["/OCGs"]) == 6

@@ -2724,6 +2724,11 @@ class PdfWriter(PdfDocCommon):
         Merge the pages from the given file into the output file at the
         specified page number.
 
+        The source document's optional content (layer) properties
+        (``/OCProperties``, including the default configuration ``/D``) are
+        merged into the output document; named configurations (``/Configs``)
+        are not imported.
+
         Args:
             position: The *page number* to insert this file. File will
                 be inserted after the given number.
@@ -2872,6 +2877,117 @@ class PdfWriter(PdfDocCommon):
 
         if "/B" not in excluded_fields:
             self.add_filtered_articles("", srcpages, reader)
+
+        self._merge_oc_properties(reader)
+
+    def _merge_oc_properties(self, reader: PdfDocCommon) -> None:
+        """
+        Import the optional content (layer) properties of a merged document.
+
+        The source document's ``/OCGs`` list and default configuration
+        (``/D``) are merged into the target document's ``/OCProperties``
+        dictionary. References to OCG/OCMD objects (including OCMD members
+        and visibility expressions) are remapped to the corresponding cloned
+        objects in the target document, so layers shared by several pages
+        of one source document stay shared, while identically named layers
+        from different source documents remain distinct objects.
+
+        An existing ``/OCProperties`` configuration in the target document
+        is never overwritten: entries already present are kept and the
+        source entries are appended. Named configurations (``/Configs``) are
+        not imported.
+        """
+        src_oc_properties = reader.root_object.get(CatalogAttributes.OC_PROPERTIES)
+        if is_null_or_none(src_oc_properties):
+            return
+        assert src_oc_properties is not None, "mypy: TypeGuard of is_null_or_none does not help here."
+        src_oc_properties = src_oc_properties.get_object()
+        if not isinstance(src_oc_properties, DictionaryObject):
+            return
+        if src_oc_properties.get("/Configs") is not None:
+            logger_warning(
+                "Named optional content configurations (/Configs) are not imported",
+                source=__name__,
+            )
+
+        dst_oc_properties = self._root_object.get(CatalogAttributes.OC_PROPERTIES)
+        if dst_oc_properties is None:
+            oc_properties_ref = self._add_object(DictionaryObject())
+            self._root_object[NameObject(CatalogAttributes.OC_PROPERTIES)] = oc_properties_ref
+            dst_oc_properties = oc_properties_ref.get_object()
+        else:
+            dst_oc_properties = dst_oc_properties.get_object()
+        assert isinstance(dst_oc_properties, DictionaryObject), "mypy"
+
+        # Merge the list of optional content groups.
+        dst_ocgs = dst_oc_properties.get("/OCGs")
+        if dst_ocgs is None:
+            dst_ocgs = ArrayObject()
+            dst_oc_properties[NameObject("/OCGs")] = dst_ocgs
+        else:
+            dst_ocgs = dst_ocgs.get_object()
+        src_ocgs = src_oc_properties.get("/OCGs")
+        if src_ocgs is not None and isinstance(src_ocgs.get_object(), list):
+            for ocg in src_ocgs.get_object():
+                cloned = self._clone_oc_property_value(ocg)
+                if cloned not in dst_ocgs:
+                    dst_ocgs.append(cloned)
+
+        # Merge the default configuration (/D); named configurations
+        # (/Configs) are deliberately not imported.
+        src_default = src_oc_properties.get("/D")
+        if src_default is None:
+            return
+        src_default = src_default.get_object()
+        if not isinstance(src_default, DictionaryObject):
+            return
+        dst_default = dst_oc_properties.get("/D")
+        if dst_default is None:
+            dst_oc_properties[NameObject("/D")] = src_default.clone(self)
+            return
+        dst_default = dst_default.get_object()
+        for key, value in src_default.items():
+            if key in ("/ON", "/OFF", "/Order", "/RBGroups", "/Locked", "/AS"):
+                mapped = self._clone_oc_property_value(value)
+                existing = dst_default.get(key)
+                if existing is None:
+                    dst_default[key] = mapped
+                    continue
+                existing_array = existing.get_object()
+                if not isinstance(existing_array, list):
+                    continue
+                mapped_items = mapped if isinstance(mapped, list) else [mapped]
+                for item in mapped_items:
+                    if item not in existing_array:
+                        existing_array.append(item)
+            elif key not in dst_default:
+                # Scalar entries (e.g. /BaseState, /Intent, /Name, /Creator)
+                # of an existing configuration are not overwritten.
+                dst_default[key] = self._clone_oc_property_value(value)
+
+    def _clone_oc_property_value(self, value: Any) -> Any:
+        """
+        Clone a value from an ``/OCProperties`` structure into this document.
+
+        Indirect references (OCG/OCMD objects) are remapped to the objects
+        already cloned into this document; arrays and dictionaries (nested
+        ``/Order`` groups, ``/RBGroups``, OCMD visibility expressions, ...)
+        are processed recursively.
+        """
+        if isinstance(value, IndirectObject):
+            return value.clone(self)
+        if isinstance(value, ArrayObject):
+            return ArrayObject(
+                [self._clone_oc_property_value(item) for item in value]
+            )
+        if isinstance(value, DictionaryObject):
+            return DictionaryObject(
+                {
+                    key: self._clone_oc_property_value(item)
+                    for key, item in value.items()
+                }
+            )
+        return value
 
     def _merge__process_named_dests(self, dest: Any, reader: PdfDocCommon, srcpages: dict[int, PageObject]) -> None:
         arr: Any = dest.dest_array

@@ -57,7 +57,7 @@ else:
 from ._doc_common import DocumentInformation, PdfDocCommon
 from ._encryption import EncryptAlgorithm, Encryption
 from ._page import PageObject, Transformation
-from ._page_labels import nums_clear_range, nums_insert, nums_next
+from ._page_labels import iter_page_label_entries, nums_clear_range, nums_insert, nums_next
 from ._reader import PdfReader
 from ._utils import (
     StrByteType,
@@ -664,6 +664,326 @@ class PdfWriter(PdfDocCommon):
         if index >= len(self.flattened_pages):
             return self.add_page(page, excluded_keys)
         return self._add_page(page, index, excluded_keys)
+
+    def reorder_pages(self, order: Sequence[int]) -> None:
+        """
+        Reorder the pages of the writer without changing their content.
+
+        The argument is a permutation of the current page indices: the new
+        page at index ``i`` is the page previously found at index ``order[i]``.
+        For example, ``writer.reorder_pages([3, 0, 5, 1, 4, 2])`` moves old
+        page 3 to the front and old page 2 to the end. The number of pages is
+        unchanged and every page appears exactly once.
+
+        Internal links, bookmarks and named destinations keep pointing to the
+        same pages as before, whether they reference a page object directly or
+        a page by its old index. Destination parameters (such as ``/XYZ`` or
+        ``/Fit`` arguments) are preserved and remote ``/GoToR`` actions are
+        left untouched. Page labels are rearranged as well, so each page keeps
+        displaying the label it had before the reordering; the outline tree
+        itself is not reordered.
+
+        Args:
+            order: The new order given as old page indices. It must contain
+                every page index exactly once. Missing, duplicated or out of
+                range indices raise a ``ValueError`` and leave the document
+                unchanged.
+
+        Raises:
+            ValueError: If ``order`` is not a permutation of the page indices.
+
+        """
+        assert self.flattened_pages is not None, "mypy"
+        page_count = len(self.flattened_pages)
+        indices = list(order)
+        if (
+            not all(isinstance(index, int) and not isinstance(index, bool) for index in indices)
+            or len(indices) != page_count
+            or len(set(indices)) != page_count
+            or any(index < 0 or index >= page_count for index in indices)
+        ):
+            raise ValueError(
+                "order must be a permutation of the page indices "
+                f"0..{page_count - 1}, got {order!r}"
+            )
+        if indices == list(range(page_count)):
+            return
+
+        # new_position[old_index] = new index of the page
+        new_position = [0] * page_count
+        for new_index, old_index in enumerate(indices):
+            new_position[old_index] = new_index
+
+        # Capture the label each page displays before touching the page tree.
+        label_templates = self._snapshot_page_labels()
+        self._remap_page_destinations(new_position)
+        self._rebuild_page_tree(indices)
+        self._restore_page_labels(indices, label_templates)
+
+    def _snapshot_page_labels(self) -> list[Optional[DictionaryObject]]:
+        """Return the effective page label dictionary of every current page."""
+        assert self.flattened_pages is not None, "mypy"
+        page_count = len(self.flattened_pages)
+        templates: list[Optional[DictionaryObject]] = [None] * page_count
+        if CatalogAttributes.PAGE_LABELS not in self._root_object:
+            return templates
+        page_labels = self._root_object[CatalogAttributes.PAGE_LABELS].get_object()
+        if not isinstance(page_labels, DictionaryObject):
+            return templates
+        entries = iter_page_label_entries(page_labels, page_count)
+        for start, template in entries:
+            templates[start] = template
+        current: Optional[DictionaryObject] = None
+        for index in range(page_count):
+            if templates[index] is not None:
+                current = templates[index]
+            elif current is not None:
+                templates[index] = current
+        return templates
+
+    def _restore_page_labels(
+        self,
+        order: Sequence[int],
+        old_templates: Sequence[Optional[DictionaryObject]],
+    ) -> None:
+        """Rebuild /PageLabels so every page keeps its previous label."""
+        assert self.flattened_pages is not None, "mypy"
+        page_count = len(self.flattened_pages)
+
+        def base_template(template: Optional[DictionaryObject]) -> DictionaryObject:
+            base = DictionaryObject()
+            if template is not None:
+                for key, value in template.items():
+                    if key != "/St":
+                        base[NameObject(str(key))] = value
+            else:
+                base[NameObject("/S")] = NameObject("/D")
+            return base
+
+        def start_value(template: Optional[DictionaryObject]) -> int:
+            if template is None:
+                return 1
+            start = template.get("/St")
+            return int(start) if isinstance(start, int) else 1
+
+        nums = ArrayObject()
+        run_start = 0
+        while run_start < page_count:
+            old_index = order[run_start]
+            template = old_templates[old_index]
+            base = base_template(template)
+            first_number = start_value(template) + (
+                old_index
+                - self._segment_start(old_index, old_templates)
+            )
+            label = DictionaryObject()
+            for key, value in base.items():
+                label[NameObject(str(key))] = value
+            if first_number != 1:
+                label[NameObject("/St")] = NumberObject(first_number)
+            run_end = run_start + 1
+            while run_end < page_count:
+                next_old_index = order[run_end]
+                next_template = old_templates[next_old_index]
+                if base_template(next_template) != base:
+                    break
+                next_number = start_value(next_template) + (
+                    next_old_index
+                    - self._segment_start(next_old_index, old_templates)
+                )
+                if next_number != first_number + (run_end - run_start):
+                    break
+                run_end += 1
+            nums.append(NumberObject(run_start))
+            nums.append(label)
+            run_start = run_end
+
+        page_labels = TreeObject()
+        page_labels[NameObject("/Nums")] = nums
+        self._root_object[NameObject(CatalogAttributes.PAGE_LABELS)] = page_labels
+
+    @staticmethod
+    def _segment_start(
+        old_index: int,
+        old_templates: Sequence[Optional[DictionaryObject]],
+    ) -> int:
+        """Return the index where the label range of ``old_index`` starts."""
+        template = old_templates[old_index]
+        start = old_index
+        while start > 0 and old_templates[start - 1] is template:
+            start -= 1
+        return start
+
+    def _rebuild_page_tree(self, order: Sequence[int]) -> None:
+        """Rebuild a flat page tree following the given new page order."""
+        assert self.flattened_pages is not None, "mypy"
+        pages_root = cast(DictionaryObject, self._pages.get_object())
+        new_pages = [self.flattened_pages[old_index] for old_index in order]
+        refs = ArrayObject()
+        for page in new_pages:
+            reference = cast(IndirectObject, page.indirect_reference)
+            page[NameObject(PagesAttributes.PARENT)] = self._pages
+            refs.append(reference)
+        pages_root[NameObject(PagesAttributes.KIDS)] = refs
+        pages_root[NameObject(PagesAttributes.COUNT)] = NumberObject(len(new_pages))
+        self.flattened_pages = new_pages
+
+    def _remap_page_destinations(self, new_position: Sequence[int]) -> None:
+        """Update index based internal destinations for the new page order."""
+        page_count = len(new_position)
+
+        def remap_dest_value(value: PdfObject) -> PdfObject:
+            value = value.get_object() if isinstance(value, IndirectObject) else value
+            if not isinstance(value, ArrayObject) or not value:
+                return value
+            target = value[0]
+            if isinstance(target, NumberObject):
+                old_index = int(target)
+                if 0 <= old_index < page_count:
+                    value[0] = NumberObject(new_position[old_index])
+            # Destinations referencing a page object directly follow that
+            # object and therefore need no change.
+            return value
+
+        def remap_action(raw_action: PdfObject) -> Optional[DictionaryObject]:
+            action = raw_action.get_object() if isinstance(raw_action, IndirectObject) else raw_action
+            if not isinstance(action, DictionaryObject):
+                return None
+            # Remote destinations are page indexes of another document.
+            if action.get(GoToActionArguments.S) == NameObject("/GoToR"):
+                return action
+            if GoToActionArguments.D not in action:
+                return action
+            action[NameObject(GoToActionArguments.D)] = remap_dest_value(action[GoToActionArguments.D])
+            return action
+
+        def remap_dest_entry(container: DictionaryObject, key: str) -> None:
+            raw_dest = container.raw_get(key)
+            resolved = remap_dest_value(raw_dest)
+            if resolved is not None and not is_null_or_none(resolved):
+                container[NameObject(key)] = resolved
+
+        # Links and other page annotations
+        for page in cast("Sequence[PageObject]", self.pages):
+            annotations = page.raw_get("/Annots") if "/Annots" in page else NullObject()
+            if isinstance(annotations, IndirectObject):
+                annotations = annotations.get_object()
+            if not isinstance(annotations, ArrayObject):
+                continue
+            for index, raw_annotation in enumerate(list(annotations)):
+                annotation = (
+                    raw_annotation.get_object()
+                    if isinstance(raw_annotation, IndirectObject)
+                    else raw_annotation
+                )
+                if not isinstance(annotation, DictionaryObject):
+                    continue
+                if "/Dest" in annotation:
+                    remap_dest_entry(annotation, "/Dest")
+                if "/A" in annotation:
+                    new_action = remap_action(annotation["/A"])
+                    if new_action is not None:
+                        annotation[NameObject("/A")] = new_action
+                if not isinstance(raw_annotation, IndirectObject):
+                    annotations[index] = annotation
+
+        # Outline items; the tree order itself is preserved
+        if Core.OUTLINES in self._root_object:
+            outline_root = self._root_object.raw_get(Core.OUTLINES)
+            outline_root = outline_root.get_object() if isinstance(outline_root, IndirectObject) else outline_root
+            if isinstance(outline_root, DictionaryObject):
+                stack: list[PdfObject] = [outline_root.get("/First", NullObject())]
+                visited: set[int] = set()
+                while stack:
+                    raw_item = stack.pop()
+                    if is_null_or_none(raw_item):
+                        continue
+                    item = raw_item.get_object() if isinstance(raw_item, IndirectObject) else raw_item
+                    if not isinstance(item, DictionaryObject) or id(item) in visited:
+                        continue
+                    visited.add(id(item))
+                    if "/Dest" in item:
+                        remap_dest_entry(item, "/Dest")
+                    if "/A" in item:
+                        new_action = remap_action(item["/A"])
+                        if new_action is not None:
+                            item[NameObject("/A")] = new_action
+                    stack.append(item.get("/Next", NullObject()))
+                    first_child = item.get("/First", NullObject())
+                    if not is_null_or_none(first_child):
+                        stack.append(first_child)
+
+        def walk_name_tree(node: PdfObject, visited_nodes: set[int]) -> None:
+            if isinstance(node, IndirectObject):
+                node = node.get_object()
+            if not isinstance(node, DictionaryObject) or id(node) in visited_nodes:
+                return
+            visited_nodes.add(id(node))
+            if "/Kids" in node:
+                kids = node["/Kids"]
+                if isinstance(kids, IndirectObject):
+                    kids = kids.get_object()
+                if isinstance(kids, ArrayObject):
+                    for kid in kids:
+                        walk_name_tree(kid, visited_nodes)
+                return
+            if "/Names" in node:
+                names_array = node["/Names"]
+                if isinstance(names_array, IndirectObject):
+                    names_array = names_array.get_object()
+                if isinstance(names_array, ArrayObject):
+                    index = 1
+                    while index < len(names_array):
+                        raw_value = names_array[index]
+                        value = raw_value.get_object() if isinstance(raw_value, IndirectObject) else raw_value
+                        if isinstance(value, DictionaryObject):
+                            if GoToActionArguments.D in value:
+                                value[NameObject(GoToActionArguments.D)] = remap_dest_value(
+                                    value[GoToActionArguments.D]
+                                )
+                        else:
+                            value = remap_dest_value(value)
+                        names_array[index] = value
+                        index += 2
+                return
+            # Legacy catalog /Dests dictionary: name -> destination array
+            for name, raw_value in list(node.items()):
+                value = raw_value.get_object() if isinstance(raw_value, IndirectObject) else raw_value
+                if isinstance(value, DictionaryObject) and GoToActionArguments.D in value:
+                    value[NameObject(GoToActionArguments.D)] = remap_dest_value(
+                        value[GoToActionArguments.D]
+                    )
+                elif isinstance(value, ArrayObject):
+                    node[NameObject(str(name))] = remap_dest_value(value)
+
+        catalog = self._root_object
+        if CatalogAttributes.NAMES in catalog:
+            names = catalog[CatalogAttributes.NAMES]
+            if isinstance(names, IndirectObject):
+                names = names.get_object()
+            if isinstance(names, DictionaryObject) and CatalogAttributes.DESTS in names:
+                walk_name_tree(names[CatalogAttributes.DESTS], set())
+        if CatalogAttributes.DESTS in catalog:
+            legacy = catalog[CatalogAttributes.DESTS]
+            if isinstance(legacy, IndirectObject):
+                legacy = legacy.get_object()
+            if isinstance(legacy, DictionaryObject):
+                walk_name_tree(legacy, set())
+
+        # Catalog open action
+        if CatalogAttributes.OPEN_ACTION in catalog:
+            raw_open_action = catalog.raw_get(CatalogAttributes.OPEN_ACTION)
+            open_action = (
+                raw_open_action.get_object()
+                if isinstance(raw_open_action, IndirectObject)
+                else raw_open_action
+            )
+            if isinstance(open_action, DictionaryObject):
+                new_action = remap_action(open_action)
+                if new_action is not None:
+                    catalog[NameObject(CatalogAttributes.OPEN_ACTION)] = new_action
+            elif isinstance(open_action, ArrayObject):
+                catalog[NameObject(CatalogAttributes.OPEN_ACTION)] = remap_dest_value(open_action)
 
     def _get_page_number_by_indirect(
         self, indirect_reference: Union[int, NullObject, IndirectObject, None]

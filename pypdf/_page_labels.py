@@ -350,3 +350,63 @@ def nums_next(
     if i < len(nums):
         return nums[i], nums[i + 1]
     return None, None
+
+
+def iter_page_label_entries(
+    page_labels: DictionaryObject,
+    page_count: int,
+) -> list[tuple[int, DictionaryObject]]:
+    """
+    Flatten a ``/PageLabels`` number tree into ``(index, label_dict)`` pairs.
+
+    Both the simple ``/Nums`` representation and the ``/Kids`` based
+    number tree representation are supported. The returned pairs are sorted
+    by index and contain at most one entry per page index.
+
+    Args:
+        page_labels: The value of the catalog's ``/PageLabels`` entry.
+        page_count: The number of pages of the document.
+
+    Returns:
+        A sorted list of ``(page_index, label_dictionary)`` pairs.
+
+    """
+    entries: list[tuple[int, DictionaryObject]] = []
+
+    def collect(node: DictionaryObject, depth: int = 0) -> None:
+        if depth > 100:
+            raise NotImplementedError("Too deep nesting is not supported.")
+        node = cast(DictionaryObject, node.get_object())
+        if not isinstance(node, DictionaryObject):
+            return
+        if "/Nums" in node:
+            nums = node["/Nums"].get_object()
+            if not isinstance(nums, ArrayObject):
+                return
+            i = 0
+            while i + 1 < len(nums):
+                key = nums[i].get_object()
+                value = nums[i + 1].get_object()
+                if isinstance(key, int) and isinstance(value, DictionaryObject):
+                    index = int(key)
+                    if 0 <= index < page_count:
+                        entries.append((index, value))
+                i += 2
+        kids = node.get("/Kids", NullObject())
+        if not is_null_or_none(kids):
+            kids = kids.get_object()
+            if isinstance(kids, ArrayObject):
+                for kid in kids:
+                    kid = kid.get_object()
+                    if isinstance(kid, DictionaryObject):
+                        collect(kid, depth + 1)
+
+    collect(page_labels)
+    entries.sort(key=lambda item: item[0])
+    unique: list[tuple[int, DictionaryObject]] = []
+    for index, value in entries:
+        if unique and unique[-1][0] == index:
+            unique[-1] = (index, value)
+        else:
+            unique.append((index, value))
+    return unique

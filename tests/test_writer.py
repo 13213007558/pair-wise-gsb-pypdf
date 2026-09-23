@@ -3868,3 +3868,176 @@ def test_update_page_form_field_values__skips_unannotated_page_in_list(caplog):
         r for r in caplog.records
         if r.levelname == "WARNING"
     ]
+
+
+def _add_text_page(writer, text):
+    """Add a page displaying the given identifying text."""
+    page = writer.add_blank_page(width=200, height=200)
+    content = DecodedStreamObject()
+    content.set_data(f"BT /F1 12 Tf 10 100 Td ({text}) Tj ET".encode())
+    page[NameObject("/Contents")] = writer._add_object(content)
+    font = DictionaryObject()
+    font[NameObject("/Type")] = NameObject("/Font")
+    font[NameObject("/Subtype")] = NameObject("/Type1")
+    font[NameObject("/BaseFont")] = NameObject("/Helvetica")
+    fonts = DictionaryObject()
+    fonts[NameObject("/F1")] = writer._add_object(font)
+    resources = DictionaryObject()
+    resources[NameObject("/Font")] = fonts
+    page[NameObject("/Resources")] = resources
+    return page
+
+
+def _make_six_page_writer():
+    """Six identified pages with labels, bookmarks, destinations and links."""
+    writer = PdfWriter()
+    for i in range(6):
+        _add_text_page(writer, f"Page {i}")
+    # Roman-numeral preface and prefixed body, to be interleaved later.
+    writer.set_page_label(0, 1, style="/r")
+    writer.set_page_label(2, 5, style="/D", prefix="A-", start=1)
+    writer.add_outline_item("preface", 0)
+    writer.add_outline_item("body", 2)
+    writer.add_outline_item("page-4", 4)
+    writer.add_named_destination("named-page-3", 3)
+    # GoTo link using a page object reference.
+    writer.add_annotation(
+        0,
+        Link(
+            target_page_index=4,
+            rect=RectangleObject([0, 0, 50, 20]),
+            fit=Fit.xyz(left=10, top=20, zoom=2),
+        ),
+    )
+    # GoTo link using a raw page number as destination.
+    writer.add_annotation(
+        1,
+        {
+            "/Type": "/Annot",
+            "/Subtype": "/Link",
+            "/Rect": RectangleObject([0, 0, 50, 20]),
+            "/Dest": [4, "/Fit"],
+        },
+    )
+    # External GoToR link: must not be modified by reordering.
+    writer.add_annotation(
+        2,
+        {
+            "/Type": "/Annot",
+            "/Subtype": "/Link",
+            "/Rect": RectangleObject([0, 0, 50, 20]),
+            "/A": {"/S": "/GoToR", "/F": "other.pdf", "/D": [4, "/Fit"]},
+        },
+    )
+    return writer
+
+
+def _page_texts(reader):
+    return [page.extract_text().strip() for page in reader.pages]
+
+
+def _outline_target_texts(reader):
+    return [
+        reader.pages[reader.get_destination_page_number(item)].extract_text().strip()
+        for item in reader.outline
+    ]
+
+
+def test_reorder_pages():
+    writer = _make_six_page_writer()
+    assert len(writer.pages) == 6
+
+    writer.reorder_pages([3, 0, 5, 1, 4, 2])
+    assert len(writer.pages) == 6
+
+    stream = BytesIO()
+    writer.write(stream)
+    stream.seek(0)
+    reader = PdfReader(stream)
+
+    # Each page appears exactly once, in the new order.
+    assert _page_texts(reader) == [
+        "Page 3", "Page 0", "Page 5", "Page 1", "Page 4", "Page 2",
+    ]
+
+    # Labels follow their page: roman preface and prefixed body interleaved.
+    assert reader.page_labels == ["A-2", "i", "A-4", "ii", "A-3", "A-1"]
+
+    # Bookmarks keep their structure and follow their page.
+    assert [item.title for item in reader.outline] == ["preface", "body", "page-4"]
+    assert _outline_target_texts(reader) == ["Page 0", "Page 2", "Page 4"]
+
+    # Named destinations follow their page.
+    named = reader.named_destinations["named-page-3"]
+    target = reader.pages[reader.get_destination_page_number(named)]
+    assert target.extract_text().strip() == "Page 3"
+
+    # GoTo links follow their page, whether they use a page object ...
+    page0 = reader.pages[1]  # the page displaying "Page 0"
+    link = page0["/Annots"][0].get_object()
+    dest = link["/Dest"]
+    # XYZ fit arguments are preserved.
+    assert list(dest[1:]) == ["/XYZ", 10, 20, 2]
+    assert dest[0] == reader.pages[4].indirect_reference
+    assert reader.pages[4].extract_text().strip() == "Page 4"
+
+    # ... or a raw page number.
+    page1 = reader.pages[3]  # the page displaying "Page 1"
+    link = page1["/Annots"][0].get_object()
+    dest = link["/Dest"]
+    assert dest[0] == 4
+    assert dest[1] == "/Fit"
+    assert reader.pages[4].extract_text().strip() == "Page 4"
+
+    # External GoToR destinations are left untouched.
+    page2 = reader.pages[5]  # the page displaying "Page 2"
+    link = page2["/Annots"][0].get_object()
+    assert link["/A"]["/S"] == "/GoToR"
+    assert list(link["/A"]["/D"]) == [4, "/Fit"]
+
+
+def test_reorder_pages_inverse_restores_navigation():
+    writer = _make_six_page_writer()
+    writer.reorder_pages([3, 0, 5, 1, 4, 2])
+    writer.reorder_pages([1, 3, 5, 0, 4, 2])  # inverse permutation
+
+    stream = BytesIO()
+    writer.write(stream)
+    stream.seek(0)
+    reader = PdfReader(stream)
+
+    assert _page_texts(reader) == [f"Page {i}" for i in range(6)]
+    assert reader.page_labels == ["i", "ii", "A-1", "A-2", "A-3", "A-4"]
+    assert [item.title for item in reader.outline] == ["preface", "body", "page-4"]
+    assert _outline_target_texts(reader) == ["Page 0", "Page 2", "Page 4"]
+    named = reader.named_destinations["named-page-3"]
+    assert reader.get_destination_page_number(named) == 3
+    link = reader.pages[1]["/Annots"][0].get_object()
+    assert link["/Dest"][0] == 4
+    link = reader.pages[2]["/Annots"][0].get_object()
+    assert list(link["/A"]["/D"]) == [4, "/Fit"]
+
+
+@pytest.mark.parametrize(
+    "order",
+    [
+        [0, 1, 2, 3, 4],  # missing page
+        [0, 1, 2, 3, 4, 4],  # duplicated page
+        [0, 1, 2, 3, 4, 6],  # out of range
+        [0, 1, 2, 3, 4, -1],  # negative index
+        [0, 1, 2, 3, 4, 5, 6],  # too many entries
+    ],
+)
+def test_reorder_pages_invalid_permutation(order):
+    writer = _make_six_page_writer()
+    pages_root = writer.root_object["/Pages"].get_object()
+    kids_before = [kid.idnum for kid in pages_root["/Kids"]]
+    labels_before = writer.root_object["/PageLabels"]
+
+    with pytest.raises(ValueError, match="permutation"):
+        writer.reorder_pages(order)
+
+    # The page tree and the catalog are left unmodified.
+    kids_after = [kid.idnum for kid in pages_root["/Kids"]]
+    assert kids_after == kids_before
+    assert writer.root_object["/PageLabels"] is labels_before

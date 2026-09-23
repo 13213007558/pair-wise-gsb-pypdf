@@ -755,6 +755,274 @@ class PdfWriter(PdfDocCommon):
         self.insert_page(page, index)
         return page
 
+    def reorder_pages(self, order: Sequence[int]) -> None:
+        """
+        Reorder the pages of this PDF file according to a permutation.
+
+        ``order`` must contain each page index exactly once: the page
+        currently at index ``order[i]`` is moved to position ``i``.
+        The total number of pages is unchanged.
+
+        Navigation targets follow their page: destinations used by outline
+        items, named destinations, GoTo link annotations and the open action
+        keep pointing to the same page, whether they reference the page
+        object or use a page number. Remote (``/GoToR``) destinations are
+        left untouched, and the outline tree keeps its structure.
+        Page labels are re-segmented so that every page keeps the label it
+        had before the reordering.
+
+        Args:
+            order: A permutation of ``range(len(self.pages))`` giving, for
+                each new position, the index of the page to place there.
+
+        Raises:
+            ValueError: If ``order`` is not a permutation of the page
+                indices (missing, duplicated or out-of-range entries).
+                The document is left unmodified in this case.
+
+        """
+        num_pages = len(self.pages)
+        assert self.flattened_pages is not None, "mypy"
+        if (
+            len(order) != num_pages
+            or any(not isinstance(index, int) for index in order)
+            or sorted(order) != list(range(num_pages))
+        ):
+            raise ValueError(
+                f"order must be a permutation of range({num_pages}), "
+                f"got {list(order)!r}"
+            )
+
+        old_pages = list(self.flattened_pages)
+        # new_index[old_index] = position of the page after reordering
+        new_index = [0] * num_pages
+        for new_position, old_position in enumerate(order):
+            new_index[old_position] = new_position
+
+        old_labels = self._get_page_labels_per_page(num_pages)
+
+        self._reorder_page_tree(old_pages, order)
+        self._remap_reordered_destinations(new_index)
+        self._rebuild_page_labels(old_labels, order)
+
+    def _reorder_page_tree(
+        self, old_pages: list[PageObject], order: Sequence[int]
+    ) -> None:
+        """Place the pages in the page tree according to the permutation."""
+        # Collect the leaf slots of the page tree in document order.
+        slots: list[tuple[DictionaryObject, int]] = []
+
+        def collect_slots(node: DictionaryObject) -> None:
+            kids = cast(ArrayObject, node[PagesAttributes.KIDS])
+            for position, kid in enumerate(kids):
+                kid_object = cast(DictionaryObject, kid.get_object())
+                node_type = kid_object.get(PagesAttributes.TYPE)
+                if node_type == Core.PAGE or (
+                    node_type is None and PagesAttributes.KIDS not in kid_object
+                ):
+                    slots.append((node, position))
+                else:
+                    collect_slots(kid_object)
+
+        pages_root = cast(
+            DictionaryObject, self.root_object[Core.PAGES].get_object()
+        )
+        collect_slots(pages_root)
+        if len(slots) != len(old_pages):
+            raise PyPdfError("Page tree is inconsistent with the flattened page list")
+
+        new_pages = [old_pages[old_position] for old_position in order]
+        for (node, position), page in zip(slots, new_pages):
+            kids = cast(ArrayObject, node[PagesAttributes.KIDS])
+            kids[position] = page.indirect_reference
+            page[NameObject(PagesAttributes.PARENT)] = node.indirect_reference
+        self.flattened_pages = new_pages
+
+    def _remap_reordered_destinations(self, new_index: list[int]) -> None:
+        """Make destinations follow their page after a reordering.
+
+        Destinations referencing a page object keep pointing to the same
+        page automatically; only destinations using a page number need to
+        be remapped. Remote (``/GoToR``) destinations are left untouched.
+        """
+
+        def remap_destination(destination: Optional[PdfObject]) -> None:
+            if not isinstance(destination, ArrayObject) or len(destination) == 0:
+                return
+            first = destination[0]
+            if isinstance(first, NumberObject):
+                old_position = int(first)
+                if 0 <= old_position < len(new_index):
+                    destination[0] = NumberObject(new_index[old_position])
+
+        def remap_destination_holder(holder: DictionaryObject) -> None:
+            destination = holder.get("/Dest")
+            if isinstance(destination, ArrayObject):
+                remap_destination(destination)
+            action = holder.get("/A")
+            if isinstance(action, IndirectObject):
+                action = action.get_object()
+            if (
+                isinstance(action, DictionaryObject)
+                and action.get("/S") == "/GoTo"
+            ):
+                remap_destination(action.get("/D"))
+
+        def remap_named_destination_value(value: PdfObject) -> None:
+            resolved: Optional[PdfObject] = value
+            if isinstance(resolved, IndirectObject):
+                resolved = resolved.get_object()
+            if isinstance(resolved, ArrayObject):
+                remap_destination(resolved)
+            elif isinstance(resolved, DictionaryObject):
+                remap_destination(resolved.get("/D"))
+
+        def remap_name_tree(node: DictionaryObject) -> None:
+            names = node.get("/Names")
+            if isinstance(names, ArrayObject):
+                for i in range(1, len(names), 2):
+                    remap_named_destination_value(names[i])
+            kids = node.get("/Kids")
+            if isinstance(kids, ArrayObject):
+                for kid in kids:
+                    kid_object = kid.get_object()
+                    if isinstance(kid_object, DictionaryObject):
+                        remap_name_tree(kid_object)
+
+        # Outline items (the tree structure itself is kept as-is).
+        outlines = self._root_object.get(CatalogAttributes.OUTLINES)
+        if outlines is not None:
+            outlines_root = outlines.get_object()
+            if isinstance(outlines_root, DictionaryObject):
+                stack = []
+                first = outlines_root.get("/First")
+                if first is not None:
+                    stack.append(first)
+                while stack:
+                    item = cast(DictionaryObject, stack.pop().get_object())
+                    remap_destination_holder(item)
+                    if item.get("/Next") is not None:
+                        stack.append(item["/Next"])
+                    if item.get("/First") is not None:
+                        stack.append(item["/First"])
+
+        # Named destinations (both the name tree and the /Dests dictionary).
+        names = self._root_object.get(CatalogAttributes.NAMES)
+        if names is not None:
+            names_dict = names.get_object()
+            if isinstance(names_dict, DictionaryObject):
+                dests = names_dict.get("/Dests")
+                if dests is not None:
+                    dests_object = dests.get_object()
+                    if isinstance(dests_object, DictionaryObject):
+                        remap_name_tree(dests_object)
+        dests = self._root_object.get(CatalogAttributes.DESTS)
+        if dests is not None:
+            dests_dict = dests.get_object()
+            if isinstance(dests_dict, DictionaryObject):
+                for value in dests_dict.values():
+                    remap_named_destination_value(value)
+
+        # GoTo link annotations on the pages.
+        assert self.flattened_pages is not None, "mypy"
+        for page in self.flattened_pages:
+            annotations = page.get("/Annots")
+            if not isinstance(annotations, ArrayObject):
+                continue
+            for annotation_reference in annotations:
+                annotation = annotation_reference.get_object()
+                if (
+                    isinstance(annotation, DictionaryObject)
+                    and annotation.get("/Subtype") == "/Link"
+                ):
+                    remap_destination_holder(annotation)
+
+        # Open action of the document.
+        open_action = self._root_object.get(CatalogAttributes.OPEN_ACTION)
+        if isinstance(open_action, IndirectObject):
+            open_action = open_action.get_object()
+        if isinstance(open_action, ArrayObject):
+            remap_destination(open_action)
+        elif (
+            isinstance(open_action, DictionaryObject)
+            and open_action.get("/S") == "/GoTo"
+        ):
+            remap_destination(open_action.get("/D"))
+
+    def _get_page_labels_per_page(
+        self, num_pages: int
+    ) -> list[tuple[Optional[str], Optional[str], int]]:
+        """Compute (style, prefix, number) of the label of each page."""
+        segments: list[tuple[int, DictionaryObject]] = []
+
+        def collect_segments(node: DictionaryObject) -> None:
+            nums = node.get("/Nums")
+            if isinstance(nums, ArrayObject):
+                for i in range(0, len(nums) - 1, 2):
+                    segment = nums[i + 1].get_object()
+                    if isinstance(segment, DictionaryObject):
+                        segments.append((int(nums[i]), segment))
+            kids = node.get("/Kids")
+            if isinstance(kids, ArrayObject):
+                for kid in kids:
+                    kid_object = kid.get_object()
+                    if isinstance(kid_object, DictionaryObject):
+                        collect_segments(kid_object)
+
+        page_labels = self._root_object.get(CatalogAttributes.PAGE_LABELS)
+        if page_labels is not None:
+            page_labels_object = page_labels.get_object()
+            if isinstance(page_labels_object, DictionaryObject):
+                collect_segments(page_labels_object)
+        segments.sort(key=lambda segment: segment[0])
+
+        # Without any label segment, pages are labeled with decimal
+        # numbers; write that default explicitly so that the labels
+        # follow the pages after the reordering.
+        default_style: Optional[str] = None if segments else "/D"
+        labels: list[tuple[Optional[str], Optional[str], int]] = []
+        for index in range(num_pages):
+            style: Optional[str] = default_style
+            prefix: Optional[str] = None
+            number = index + 1
+            for start, segment in segments:
+                if start > index:
+                    break
+                style = cast(Optional[str], segment.get("/S"))
+                prefix = cast(Optional[str], segment.get("/P"))
+                number = int(segment.get("/St", 1)) + (index - start)
+            labels.append((style, prefix, number))
+        return labels
+
+    def _rebuild_page_labels(
+        self,
+        old_labels: list[tuple[Optional[str], Optional[str], int]],
+        order: Sequence[int],
+    ) -> None:
+        """Re-segment /PageLabels so each page keeps its previous label."""
+        nums = ArrayObject()
+        previous: Optional[tuple[Optional[str], Optional[str], int]] = None
+        for new_position, old_position in enumerate(order):
+            style, prefix, number = old_labels[old_position]
+            if previous is None or previous != (
+                style,
+                prefix,
+                number - 1,
+            ):
+                label = DictionaryObject()
+                if style is not None:
+                    label[NameObject("/S")] = NameObject(style)
+                if prefix is not None:
+                    label[NameObject("/P")] = TextStringObject(prefix)
+                if number != 1:
+                    label[NameObject("/St")] = NumberObject(number)
+                nums.append(NumberObject(new_position))
+                nums.append(label)
+            previous = (style, prefix, number)
+        page_labels = DictionaryObject()
+        page_labels[NameObject("/Nums")] = nums
+        self._root_object[NameObject(CatalogAttributes.PAGE_LABELS)] = page_labels
+
     @property
     def open_destination(
         self,

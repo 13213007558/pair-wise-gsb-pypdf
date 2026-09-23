@@ -1743,6 +1743,324 @@ def test_attachments():
     assert att["foobar2.txt"] == [b"foobarcontent2", b"2nd_foobarcontent"]
 
 
+def _make_filespec(writer, name, content, uf=None, relationship=None):
+    """Create a file specification dictionary with an embedded file stream."""
+    embedded_stream = DecodedStreamObject()
+    embedded_stream.set_data(content)
+    embedded_stream[NameObject("/Type")] = NameObject("/EmbeddedFile")
+    embedded_stream[NameObject("/Params")] = DictionaryObject({
+        NameObject("/Size"): NumberObject(len(content)),
+        NameObject("/ModDate"): TextStringObject("D:20260101000000Z"),
+    })
+    embedded_reference = writer._add_object(embedded_stream)
+    filespec = DictionaryObject()
+    filespec[NameObject("/Type")] = NameObject("/Filespec")
+    filespec[NameObject("/F")] = TextStringObject(name)
+    if uf is not None:
+        filespec[NameObject("/UF")] = TextStringObject(uf)
+    filespec[NameObject("/EF")] = DictionaryObject({NameObject("/F"): embedded_reference})
+    if relationship is not None:
+        filespec[NameObject("/AFRelationship")] = NameObject(relationship)
+    return writer._add_object(filespec)
+
+
+def _register_attachment_name(writer, name, filespec_reference):
+    """Register a file specification in the document's EmbeddedFiles name tree."""
+    writer._root_object[NameObject("/Names")] = DictionaryObject({
+        NameObject("/EmbeddedFiles"): DictionaryObject({
+            NameObject("/Names"): ArrayObject([TextStringObject(name), filespec_reference])
+        })
+    })
+
+
+def _to_bytes(writer):
+    stream = BytesIO()
+    writer.write(stream)
+    stream.seek(0)
+    return stream
+
+
+def _doc_with_annotation_attachment():
+    """Document whose attachment is referenced by a page FileAttachment annotation."""
+    writer = PdfWriter()
+    page = writer.add_blank_page(100, 100)
+    filespec = _make_filespec(writer, "report.txt", b"content-from-annotation")
+    _register_attachment_name(writer, "report.txt", filespec)
+    annotation = DictionaryObject({
+        NameObject("/Type"): NameObject("/Annot"),
+        NameObject("/Subtype"): NameObject("/FileAttachment"),
+        NameObject("/Rect"): ArrayObject([NumberObject(0), NumberObject(0), NumberObject(10), NumberObject(10)]),
+        NameObject("/FS"): filespec,
+        NameObject("/Name"): NameObject("/PushPin"),
+    })
+    page[NameObject("/Annots")] = ArrayObject([writer._add_object(annotation)])
+    return _to_bytes(writer)
+
+
+def _doc_with_catalog_af_attachment():
+    """Document whose attachment is associated through the catalog's /AF array."""
+    writer = PdfWriter()
+    writer.add_blank_page(100, 100)
+    filespec = _make_filespec(writer, "report.txt", b"content-from-catalog", uf="report.txt", relationship="/Data")
+    _register_attachment_name(writer, "report.txt", filespec)
+    writer._root_object[NameObject("/AF")] = ArrayObject([filespec])
+    return _to_bytes(writer)
+
+
+def _doc_with_struct_element_attachment():
+    """Document whose attachment is referenced by a structure element's /AF entry."""
+    writer = PdfWriter()
+    writer.add_blank_page(100, 100)
+    filespec = _make_filespec(writer, "report.txt", b"content-from-struct")
+    _register_attachment_name(writer, "report.txt", filespec)
+    struct_element = DictionaryObject({
+        NameObject("/Type"): NameObject("/StructElem"),
+        NameObject("/S"): NameObject("/Document"),
+        NameObject("/AF"): ArrayObject([filespec]),
+    })
+    writer._root_object[NameObject("/StructTreeRoot")] = writer._add_object(DictionaryObject({
+        NameObject("/Type"): NameObject("/StructTreeRoot"),
+        NameObject("/K"): ArrayObject([writer._add_object(struct_element)]),
+    }))
+    return _to_bytes(writer)
+
+
+def _doc_with_attachment(name, content, uf=None):
+    writer = PdfWriter()
+    writer.add_blank_page(100, 100)
+    filespec = _make_filespec(writer, name, content, uf=uf)
+    _register_attachment_name(writer, name, filespec)
+    return _to_bytes(writer)
+
+
+def test_append_with_attachments():
+    """Attachments survive append() and stay independent across source boundaries."""
+    writer = PdfWriter()
+    writer.append(_doc_with_annotation_attachment(), import_attachments=True)
+    writer.append(_doc_with_catalog_af_attachment(), import_attachments=True)
+    writer.append(_doc_with_struct_element_attachment(), import_attachments=True)
+    stream = _to_bytes(writer)
+
+    reader = PdfReader(stream)
+    # The three sources use the same attachment name for different objects;
+    # all of them are preserved, the later ones under unique names.
+    assert reader.attachments["report.txt"] == [b"content-from-annotation"]
+    assert reader.attachments["report (1).txt"] == [b"content-from-catalog"]
+    assert reader.attachments["report (2).txt"] == [b"content-from-struct"]
+
+    # Trace every name tree entry to its file specification.
+    names = reader.root_object["/Names"]["/EmbeddedFiles"]["/Names"]
+    filespecs = {}
+    for index in range(0, len(names), 2):
+        filespecs[str(names[index])] = names[index + 1]
+    assert sorted(filespecs) == ["report (1).txt", "report (2).txt", "report.txt"]
+
+    # The catalog /AF array references the same (renamed) object as the name tree.
+    catalog_af = reader.root_object["/AF"]
+    assert len(catalog_af) == 1
+    assert catalog_af[0].indirect_reference == filespecs["report (1).txt"].indirect_reference
+    assert catalog_af[0].get_object()["/AFRelationship"] == "/Data"
+    assert catalog_af[0].get_object()["/F"] == "report (1).txt"
+
+    # The page annotation references the same object as the name tree entry.
+    annotation = reader.pages[0]["/Annots"][0].get_object()
+    assert annotation["/Subtype"] == "/FileAttachment"
+    assert annotation["/FS"].indirect_reference == filespecs["report.txt"].indirect_reference
+
+    # Embedded file stream parameters survived the migration.
+    embedded = filespecs["report.txt"].get_object()["/EF"]["/F"].get_object()
+    assert embedded["/Params"]["/Size"] == len(b"content-from-annotation")
+    assert embedded["/Params"]["/ModDate"] == "D:20260101000000Z"
+
+    # Deleting one attachment does not affect the other same-named objects.
+    entries = list(reader.attachment_list)
+    victim = next(entry for entry in entries if entry.name == "report (1).txt")
+    victim.delete()
+    cleaned = PdfWriter()
+    cleaned.clone_document_from_reader(reader)
+    reread = PdfReader(_to_bytes(cleaned))
+    assert "report (1).txt" not in reread.attachments
+    assert reread.attachments["report.txt"] == [b"content-from-annotation"]
+    assert reread.attachments["report (2).txt"] == [b"content-from-struct"]
+
+
+def test_merge_attachments_same_source_twice():
+    """Merging the same source twice does not duplicate its attachments."""
+    source = PdfReader(_doc_with_catalog_af_attachment())
+    writer = PdfWriter()
+    writer.append(source, import_attachments=True)
+    writer.append(source, import_attachments=True)
+    reader = PdfReader(_to_bytes(writer))
+    assert list(reader.attachments.keys()) == ["report.txt"]
+    assert len(reader.root_object["/AF"]) == 1
+
+
+def test_merge_attachments_not_imported_by_default():
+    writer = PdfWriter()
+    writer.append(_doc_with_attachment("report.txt", b"content"))
+    reader = PdfReader(_to_bytes(writer))
+    assert reader.attachments == {}
+    assert "/AF" not in reader.root_object
+
+
+def test_merge_attachments_name_conflict_reject():
+    writer = PdfWriter()
+    writer.add_blank_page(100, 100)
+    writer.add_attachment("report.txt", b"existing")
+    with pytest.raises(PyPdfError, match="already exists"):
+        writer.append(
+            _doc_with_attachment("report.txt", b"incoming"),
+            import_attachments=True,
+            attachment_name_conflict="reject",
+        )
+    # The pre-existing attachment is untouched.
+    reader = PdfReader(_to_bytes(writer))
+    assert reader.attachments["report.txt"] == [b"existing"]
+
+
+def test_merge_attachments_name_conflict_replace():
+    writer = PdfWriter()
+    writer.add_blank_page(100, 100)
+    writer.add_attachment("report.txt", b"existing")
+    writer.add_attachment("other.txt", b"other")
+    writer.append(
+        _doc_with_attachment("report.txt", b"incoming"),
+        import_attachments=True,
+        attachment_name_conflict="replace",
+    )
+    reader = PdfReader(_to_bytes(writer))
+    assert reader.attachments["report.txt"] == [b"incoming"]
+    assert reader.attachments["other.txt"] == [b"other"]
+
+
+def test_merge_attachments_invalid_name_conflict():
+    writer = PdfWriter()
+    with pytest.raises(ValueError, match="name_conflict"):
+        writer.append(
+            _doc_with_attachment("report.txt", b"incoming"),
+            import_attachments=True,
+            attachment_name_conflict="invalid",
+        )
+
+
+def test_merge_attachments_unicode_and_relative_names():
+    writer = PdfWriter()
+    writer.add_blank_page(100, 100)
+    writer.add_attachment("dir/report.txt", b"existing")
+    writer.add_attachment("résumé.txt", b"existing-unicode")
+    writer.append(_doc_with_attachment("dir/report.txt", b"incoming"), import_attachments=True)
+    writer.append(
+        _doc_with_attachment("résumé.txt", b"incoming-unicode", uf="résumé.txt"),
+        import_attachments=True,
+    )
+    reader = PdfReader(_to_bytes(writer))
+    assert reader.attachments["dir/report.txt"] == [b"existing"]
+    assert reader.attachments["dir/report (1).txt"] == [b"incoming"]
+    assert reader.attachments["résumé.txt"] == [b"existing-unicode"]
+    assert reader.attachments["résumé (1).txt"] == [b"incoming-unicode"]
+
+
+def test_merge_attachments_without_attachments_keeps_byte_behavior():
+    plain = PdfWriter()
+    plain.add_blank_page(100, 100)
+    source = _to_bytes(plain)
+
+    default_writer = PdfWriter()
+    default_writer.append(BytesIO(source.getvalue()))
+    default_stream = _to_bytes(default_writer)
+
+    importing_writer = PdfWriter()
+    importing_writer.append(BytesIO(source.getvalue()), import_attachments=True)
+    importing_stream = _to_bytes(importing_writer)
+
+    assert default_stream.getvalue() == importing_stream.getvalue()
+
+
+def test_merge_attachments_shared_filespec_within_source():
+    # Within one source, the name tree and the page /AF reference the same
+    # file specification; the merged document keeps this sharing.
+    writer = PdfWriter()
+    page = writer.add_blank_page(100, 100)
+    filespec = _make_filespec(writer, "shared.txt", b"shared-content")
+    _register_attachment_name(writer, "shared.txt", filespec)
+    page[NameObject("/AF")] = ArrayObject([filespec])
+
+    merged = PdfWriter()
+    merged.append(_to_bytes(writer), import_attachments=True)
+    reader = PdfReader(_to_bytes(merged))
+    name_reference = reader.root_object["/Names"]["/EmbeddedFiles"]["/Names"][1]
+    page_af_reference = reader.pages[0]["/AF"][0]
+    assert name_reference.indirect_reference == page_af_reference.indirect_reference
+    assert reader.attachments["shared.txt"] == [b"shared-content"]
+
+
+def test_merge_attachments_kids_name_tree():
+    writer = PdfWriter()
+    writer.add_blank_page(100, 100)
+    filespec1 = _make_filespec(writer, "kid1.txt", b"kid1")
+    filespec2 = _make_filespec(writer, "kid2.txt", b"kid2")
+    kid = DictionaryObject({
+        NameObject("/Names"): ArrayObject([
+            TextStringObject("kid1.txt"), filespec1,
+            TextStringObject("kid2.txt"), filespec2,
+        ]),
+        NameObject("/Limits"): ArrayObject([TextStringObject("kid1.txt"), TextStringObject("kid2.txt")]),
+    })
+    writer._root_object[NameObject("/Names")] = DictionaryObject({
+        NameObject("/EmbeddedFiles"): DictionaryObject({
+            NameObject("/Kids"): ArrayObject([writer._add_object(kid)]),
+            NameObject("/Limits"): ArrayObject([TextStringObject("kid1.txt"), TextStringObject("kid2.txt")]),
+        })
+    })
+
+    merged = PdfWriter()
+    merged.append(_to_bytes(writer), import_attachments=True)
+    reader = PdfReader(_to_bytes(merged))
+    assert reader.attachments["kid1.txt"] == [b"kid1"]
+    assert reader.attachments["kid2.txt"] == [b"kid2"]
+
+
+def test_merge_attachments_broken_reference():
+    writer = PdfWriter()
+    writer.add_blank_page(100, 100)
+    writer._root_object[NameObject("/Names")] = DictionaryObject({
+        NameObject("/EmbeddedFiles"): DictionaryObject({
+            NameObject("/Names"): ArrayObject([TextStringObject("broken.txt"), NumberObject(42)])
+        })
+    })
+    merged = PdfWriter()
+    with pytest.raises(PyPdfError, match="file specification"):
+        merged.append(_to_bytes(writer), import_attachments=True)
+
+
+def test_merge_attachments_encrypted():
+    # Encrypted source document.
+    source = PdfWriter()
+    source.add_blank_page(100, 100)
+    filespec = _make_filespec(source, "secret.txt", b"secret-content")
+    _register_attachment_name(source, "secret.txt", filespec)
+    source.encrypt("userpassword", "ownerpassword")
+    source_reader = PdfReader(_to_bytes(source))
+    source_reader.decrypt("userpassword")
+
+    # Encrypted target document.
+    merged = PdfWriter()
+    merged.append(source_reader, import_attachments=True)
+    merged.encrypt("targetpassword")
+    reader = PdfReader(_to_bytes(merged))
+    reader.decrypt("targetpassword")
+    assert reader.attachments["secret.txt"] == [b"secret-content"]
+
+
+def test_merge_attachments_with_position():
+    merged = PdfWriter()
+    merged.add_blank_page(100, 100)
+    merged.merge(1, _doc_with_attachment("mid.txt", b"mid"), import_attachments=True)
+    reader = PdfReader(_to_bytes(merged))
+    assert len(reader.pages) == 2
+    assert reader.attachments["mid.txt"] == [b"mid"]
+
+
 @pytest.mark.enable_socket
 def test_iss1614():
     # test of an annotation(link) directly stored in the /Annots in the page

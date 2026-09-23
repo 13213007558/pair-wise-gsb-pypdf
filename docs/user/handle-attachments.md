@@ -101,6 +101,31 @@ if it exists. Deleting them as well would require us to know where this has
 been defined, which requires more complexity. For now, please consider looking
 for the corresponding definition yourself and delete it from the array.
 
+## Merge Attachments
+
+By default, `PdfWriter.append` and `PdfWriter.merge` do not carry the
+attachments of the source documents over. Pass `import_attachments=True` to
+migrate the embedded files name tree, the file specification dictionaries
+(including the embedded file streams) and the associated file references
+(`/AF` arrays of the document catalog and of the merged pages, `/FS`
+entries of file attachment annotations and `/AF` entries of structure
+elements):
+
+```{testcode}
+from pypdf import PdfWriter
+
+writer = PdfWriter()
+writer.append("example.pdf", import_attachments=True)
+writer.write("out-merged.pdf")
+```
+
+References to the same file specification within one source document keep
+sharing a single object. If different source documents use the same attachment
+name for different files, all of them are preserved; the
+`attachment_name_conflict` argument selects how the collision is resolved:
+`"rename"` (default) inserts the incoming attachment under a unique name,
+`"reject"` raises an error and `"replace"` replaces the existing attachment.
+
 ## PDF/A compliance
 
 The following example shows how to add an attachment to a PDF/A-3B compliant document

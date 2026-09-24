@@ -23,6 +23,12 @@ class PyPdfError(Exception):
 class PdfReadError(PyPdfError):
     """Raised when there is an issue reading a PDF file."""
 
+class SignatureIntegrityError(PyPdfError):
+    """
+    Raised when an incremental update would invalidate a digital signature
+    embedded in the document.
+    """
+
 
 class PageSizeNotDefinedError(PyPdfError):
     """Raised when the page size of a PDF document is not defined."""

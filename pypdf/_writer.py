@@ -30,10 +30,13 @@
 import decimal
 import enum
 import hashlib
+import os
 import re
 import struct
 import sys
+import tempfile
 from collections.abc import Iterable, Mapping, Sequence
+from contextlib import suppress
 from io import BytesIO, FileIO, IOBase
 from itertools import compress
 from pathlib import Path
@@ -59,6 +62,7 @@ from ._encryption import EncryptAlgorithm, Encryption
 from ._page import PageObject, Transformation
 from ._page_labels import nums_clear_range, nums_insert, nums_next
 from ._reader import PdfReader
+from ._signatures import validate_incremental_update
 from ._utils import (
     StrByteType,
     StreamType,
@@ -161,6 +165,16 @@ class PdfWriter(PdfDocCommon):
 
             When writing incrementally, the original document is written first and new/modified
             content is appended. To be used for signed document/forms to keep signature valid.
+
+            If the original document contains digital signatures, the update is
+            validated before anything is written: changes to signature fields,
+            signature dictionaries or objects covered by a signature
+            ``/ByteRange`` are rejected with
+            :class:`pypdf.errors.SignatureIntegrityError`. Only objects
+            outside the covered byte ranges may be modified, and only by
+            appending a new revision. See :mod:`pypdf._signatures` for the
+            exact capability boundaries (multiple signatures, DocMDP,
+            linearized files).
 
         full: If true, loads all the objects (always full if incremental = True).
             This parameter may allow loading large PDFs.
@@ -1367,6 +1381,14 @@ class PdfWriter(PdfDocCommon):
             new_link.patch_reference(self, new_page)
 
     def write_stream(self, stream: StreamType) -> None:
+        """
+        Write the PDF data to a stream.
+
+        The position of ``stream`` is left at the end of the written data;
+        the stream is neither flushed nor closed (that is the caller's
+        responsibility). In incremental mode, the stream of the underlying
+        reader is read from the start and its position is left at its end.
+        """
         if hasattr(stream, "mode") and "b" not in stream.mode:
             logger_warning(
                 "File <%(stream_name)s> to write to is not in binary mode. "
@@ -1378,6 +1400,9 @@ class PdfWriter(PdfDocCommon):
 
         if self.incremental:
             assert self._reader is not None, "mypy"
+            # Raises before any byte is written if the update would
+            # invalidate a signature of the original document.
+            validate_incremental_update(self)
             self._reader.stream.seek(0)
             stream.write(self._reader.stream.read(-1))
             if len(self.list_objects_in_increment()) > 0:
@@ -1399,6 +1424,16 @@ class PdfWriter(PdfDocCommon):
                 be a file path, just like the fileobj, just named it stream to keep
                 existing workflow.
 
+            Stream position and ownership: after writing, the position of a
+            caller-provided stream is left at the end of the written data and
+            the stream is flushed but **not** closed; pypdf never closes
+            streams it did not open itself. When a file path is given, pypdf
+            opens and closes the file itself. In incremental mode, a file
+            path target is written atomically: the new revision is rendered
+            to a temporary file in the same directory first and then moved
+            over the target, so an exception raised while writing cannot
+            truncate an existing file.
+
         Returns:
             A tuple (bool, IO).
 
@@ -1409,6 +1444,8 @@ class PdfWriter(PdfDocCommon):
             raise ValueError(f"Output({stream=}) is empty.")
 
         if isinstance(stream, (str, Path)):
+            if self.incremental:
+                return self._write_incremental_to_path(Path(stream))
             stream = FileIO(stream, "wb")
             my_file = True
 
@@ -1420,6 +1457,36 @@ class PdfWriter(PdfDocCommon):
             stream.flush()
 
         return my_file, stream
+
+    def _write_incremental_to_path(self, target: Path) -> tuple[bool, IO[Any]]:
+        """
+        Write the incremental update to a file path atomically.
+
+        The output is rendered to a temporary file in the same directory and
+        then moved over ``target`` with :func:`os.replace`, so an existing
+        file is never truncated if the write fails midway.
+
+        Args:
+            target: The path of the file to write.
+
+        Returns:
+            A tuple (bool, IO); the returned stream is already closed.
+
+        """
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=target.name + ".", suffix=".tmp", dir=target.parent
+        )
+        tmp_stream: IO[Any] = os.fdopen(fd, "wb")
+        try:
+            self.write_stream(tmp_stream)
+            tmp_stream.close()
+            os.replace(tmp_name, target)
+        except BaseException:
+            tmp_stream.close()
+            with suppress(OSError):
+                os.unlink(tmp_name)
+            raise
+        return True, tmp_stream
 
     def list_objects_in_increment(self) -> list[IndirectObject]:
         """

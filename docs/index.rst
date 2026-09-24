@@ -30,6 +30,7 @@ You can contribute to `pypdf on GitHub <https://github.com/py-pdf/pypdf>`_.
    user/extract-images
    user/handle-attachments
    user/encryption-decryption
+   user/digital-signatures
    user/merging-pdfs
    user/cropping-and-transforming
    user/reading-pdf-annotations

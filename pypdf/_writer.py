@@ -59,6 +59,12 @@ from ._encryption import EncryptAlgorithm, Encryption
 from ._page import PageObject, Transformation
 from ._page_labels import nums_clear_range, nums_insert, nums_next
 from ._reader import PdfReader
+from ._signature import (
+    SignatureCoverage,
+    extract_signature_coverages,
+    get_object_offsets,
+    is_linearized,
+)
 from ._utils import (
     StrByteType,
     StreamType,
@@ -227,6 +233,10 @@ class PdfWriter(PdfDocCommon):
 
         self._reader: Optional[PdfReader] = None
         """The document being appended to, in incremental mode only."""
+
+        self._signature_coverages: Optional[list[SignatureCoverage]] = None
+        """Cache for the signature coverages of the original document.
+        None means "not computed yet"; computed lazily in incremental mode."""
 
         self._ID: Union[ArrayObject, None] = None
         """The PDF file identifier,
@@ -1177,6 +1187,13 @@ class PdfWriter(PdfDocCommon):
             for object_id in object_ids:
                 reader_object = reader.get_object(object_id)
                 if reader_object is not None:
+                    if (
+                        isinstance(reader_object, StreamObject)
+                        and reader_object.get("/Type") == "/XRef"
+                    ):
+                        # Xref stream objects of previous revisions are not
+                        # document objects; only their id is reserved.
+                        continue
                     self._objects[object_id - 1] = reader_object.replicate(self)
         else:
             self._objects.clear()
@@ -1366,7 +1383,184 @@ class PdfWriter(PdfDocCommon):
                 continue
             new_link.patch_reference(self, new_page)
 
+    @property
+    def signature_coverages(self) -> list[SignatureCoverage]:
+        """
+        Byte-range coverages of the digital signatures found in the
+        original document.
+
+        Only computed in incremental mode; empty list otherwise.
+        Multiple signatures are all reported and all enforced.
+        """
+        if not self.incremental or self._reader is None:
+            return []
+        if self._signature_coverages is None:
+            self._signature_coverages = extract_signature_coverages(self._reader)
+        return self._signature_coverages
+
+    def _modified_objects_in_increment(self) -> list[tuple[int, PdfObject]]:
+        original_hash_count = len(self._original_hash)
+        return [
+            (i + 1, obj)
+            for i, obj in enumerate(self._objects)
+            if obj is not None
+            and (i >= original_hash_count or obj.hash_bin() != self._original_hash[i])
+        ]
+
+    def _acroform_field_idnums(self) -> tuple[set[int], Optional[int]]:
+        """
+        Ids of the objects of the AcroForm fields tree and of the AcroForm
+        dictionary itself; used for DocMDP permission checks.
+        """
+        field_ids: set[int] = set()
+        acroform = self._root_object.get("/AcroForm")
+        acroform_id = acroform.idnum if isinstance(acroform, IndirectObject) else None
+        if acroform is None:
+            return field_ids, acroform_id
+        acroform_dict = (
+            acroform.get_object() if isinstance(acroform, IndirectObject) else acroform
+        )
+        if not isinstance(acroform_dict, DictionaryObject):
+            return field_ids, acroform_id
+        fields = acroform_dict.get("/Fields")
+        if not isinstance(fields, ArrayObject):
+            return field_ids, acroform_id
+
+        def walk(field_array: ArrayObject) -> None:
+            for field in field_array:
+                if isinstance(field, IndirectObject):
+                    field_ids.add(field.idnum)
+                    field = field.get_object()
+                if not isinstance(field, DictionaryObject):
+                    continue
+                kids = field.get("/Kids")
+                if isinstance(kids, ArrayObject):
+                    walk(kids)
+
+        walk(fields)
+        return field_ids, acroform_id
+
+    @staticmethod
+    def _serialized_for_compare(value: Any) -> bytes:
+        if isinstance(value, PdfObject):
+            buffer = BytesIO()
+            value.write_to_stream(buffer)
+            return buffer.getvalue()
+        return repr(value).encode()
+
+    def _is_annotation_only_change(self, idnum: int, obj: PdfObject) -> bool:
+        """
+        Return True if obj is an annotation, or a page whose only change
+        compared to the original document is its /Annots entry.
+        """
+        if not isinstance(obj, DictionaryObject):
+            return False
+        if str(obj.get("/Type", "")) == "/Annot":
+            return True
+        if str(obj.get("/Type", "")) != "/Page":
+            return False
+        assert self._reader is not None, "mypy"
+        original = self._reader.get_object(idnum)
+        if not isinstance(original, DictionaryObject):
+            return False
+        changed = {
+            key
+            for key in set(obj.keys()) | set(original.keys())
+            if self._serialized_for_compare(obj.get(key))
+            != self._serialized_for_compare(original.get(key))
+        }
+        return changed <= {"/Annots"}
+
+    def _validate_incremental_signature_safety(self) -> None:
+        """
+        Ensure the pending increment does not invalidate existing signatures.
+
+        Raises:
+            PyPdfError: If a signature field/dictionary is modified, or if
+                the DocMDP permission of a certification signature does not
+                allow the pending changes. Raised before anything is written.
+
+        """
+        coverages = self.signature_coverages
+        if not coverages:
+            return
+        assert self._reader is not None, "mypy"
+        if is_linearized(self._reader):
+            logger_warning(
+                "Appending an incremental update to a linearized PDF invalidates "
+                "its linearization; pypdf does not update the linearization "
+                "dictionary.",
+                source=__name__,
+            )
+        modified = self._modified_objects_in_increment()
+        if not modified:
+            return
+        signature_ids = {c.signature_idnum for c in coverages}
+        signature_field_ids = {
+            c.field_idnum for c in coverages if c.field_idnum is not None
+        }
+        for idnum, _obj in modified:
+            if idnum in signature_ids or idnum in signature_field_ids:
+                raise PyPdfError(
+                    f"Modifying the signature field/dictionary (object {idnum}) "
+                    "would invalidate the existing signature(s); refusing to write."
+                )
+        docmdp_permission = min(
+            (
+                c.docmdp_permission
+                for c in coverages
+                if c.docmdp_permission is not None
+            ),
+            default=None,
+        )
+        if docmdp_permission is None:
+            return
+        offsets = get_object_offsets(self._reader)
+        original_count = len(self._original_hash)
+        form_field_ids, acroform_id = self._acroform_field_idnums()
+        for idnum, obj in modified:
+            if idnum > original_count:
+                # New object appended in the increment: not covered by any
+                # existing signature.
+                continue
+            offset = offsets.get(idnum)
+            if offset is not None and not any(
+                coverage.covers_offset(offset) for coverage in coverages
+            ):
+                # Object of a later revision, not covered by any signature.
+                continue
+            if docmdp_permission == 1:
+                raise PyPdfError(
+                    "The document certification (DocMDP P=1) does not allow "
+                    f"any change; object {idnum} is covered by the signature. "
+                    "Refusing to write."
+                )
+            if idnum in form_field_ids or idnum == acroform_id:
+                # Filling in form fields is allowed for P=2 and P=3.
+                continue
+            if docmdp_permission >= 3 and self._is_annotation_only_change(idnum, obj):
+                # Annotations are additionally allowed for P=3.
+                continue
+            raise PyPdfError(
+                f"The document certification (DocMDP P={docmdp_permission}) "
+                f"does not allow modifying object {idnum}; refusing to write."
+            )
+
     def write_stream(self, stream: StreamType) -> None:
+        """
+        Write the document to a binary stream.
+
+        The stream is left positioned at the end of the written data and is
+        not closed; closing it remains the caller's responsibility.
+
+        In incremental mode, the original document bytes are copied first
+        (byte-identical, so existing signatures keep their coverage) and the
+        new revision (modified objects, xref stream and trailer with a
+        /Prev chain) is appended. The source reader's stream is left
+        positioned at its end. Signature safety is validated before any byte
+        is written, and the increment is rendered in memory first, so a
+        failure cannot leave partially written data in the target stream.
+        """
         if hasattr(stream, "mode") and "b" not in stream.mode:
             logger_warning(
                 "File <%(stream_name)s> to write to is not in binary mode. "
@@ -1378,10 +1572,19 @@ class PdfWriter(PdfDocCommon):
 
         if self.incremental:
             assert self._reader is not None, "mypy"
-            self._reader.stream.seek(0)
-            stream.write(self._reader.stream.read(-1))
+            self._validate_incremental_signature_safety()
+            source = self._reader.stream
+            source.seek(0, 2)
+            original_size = source.tell()
+            source.seek(0)
+            increment = BytesIO()
             if len(self.list_objects_in_increment()) > 0:
-                self._write_increment(stream)  # writes objs, xref stream and startxref
+                # Render the increment in memory first (positions are relative
+                # to the end of the original document) so that a failure
+                # cannot leave partially written data behind.
+                self._write_increment(increment, original_size)
+            stream.write(source.read(-1))
+            stream.write(increment.getvalue())
         else:
             object_positions, free_objects = self._write_pdf_structure(stream)
             xref_location = self._write_xref_table(
@@ -1400,7 +1603,19 @@ class PdfWriter(PdfDocCommon):
                 existing workflow.
 
         Returns:
-            A tuple (bool, IO).
+            A tuple (bool, IO). The bool reports whether the stream was
+            opened (and closed) by this method, i.e. a path was passed.
+
+        Note:
+            If a path is given, the file is opened, written and closed by
+            this method. If a file-like object is given, it is flushed but
+            not closed, and is left positioned at the end of the written
+            data; closing it remains the caller's responsibility.
+
+            In incremental mode with a path, the whole output is rendered
+            in memory first and written in one go, so a failure (for
+            example a signature-safety violation) cannot truncate an
+            existing file on disk.
 
         """
         my_file = False
@@ -1409,6 +1624,12 @@ class PdfWriter(PdfDocCommon):
             raise ValueError(f"Output({stream=}) is empty.")
 
         if isinstance(stream, (str, Path)):
+            if self.incremental:
+                buffer = BytesIO()
+                self.write_stream(buffer)
+                with FileIO(stream, "wb") as output_file:
+                    output_file.write(buffer.getvalue())
+                return True, output_file
             stream = FileIO(stream, "wb")
             my_file = True
 
@@ -1445,8 +1666,11 @@ class PdfWriter(PdfDocCommon):
             )
         ]
 
-    def _write_increment(self, stream: StreamType) -> None:
+    def _write_increment(self, stream: StreamType, position_offset: int = 0) -> None:
         # Only reached from `write()` inside `if self.incremental`.
+        # position_offset is the absolute position of the start of the
+        # increment within the final document (i.e. the size of the
+        # original document); it is added to every relative position.
         assert self._reader is not None, "mypy"
         object_positions = {}
         object_blocks = []
@@ -1461,7 +1685,7 @@ class PdfWriter(PdfDocCommon):
                 idnum = i + 1
                 assert isinstance(obj, PdfObject), "mypy"
                 # first write new/modified object
-                object_positions[idnum] = stream.tell()
+                object_positions[idnum] = position_offset + stream.tell()
                 stream.write(f"{idnum} 0 obj\n".encode())
                 """ encryption is not operational
                 if self._encryption and obj != self._encrypt_entry:
@@ -1481,8 +1705,11 @@ class PdfWriter(PdfDocCommon):
         assert current_start > 0, "for pytest only"
         object_blocks.append([current_start, current_stop - current_start])
         # write incremented xref
-        xref_location = stream.tell()
+        xref_location = position_offset + stream.tell()
         xr_id = len(self._objects) + 1
+        # The xref stream object registers itself so that a later revision
+        # does not reuse its id for a regular object.
+        object_blocks.append([xr_id, 1])
         stream.write(f"{xr_id} 0 obj".encode())
         init_data = {
             NameObject("/Type"): NameObject("/XRef"),
@@ -1514,6 +1741,7 @@ class PdfWriter(PdfDocCommon):
             b"".join(
                 [struct.pack(b">BIB", 1, _pos, 0) for _pos in object_positions.values()]
             )
+            + struct.pack(b">BIB", 1, xref_location, 0)
         )
         xr.write_to_stream(stream)
         stream.write(f"\nendobj\nstartxref\n{xref_location}\n%%EOF\n".encode())  # eof
@@ -1648,6 +1876,12 @@ class PdfWriter(PdfDocCommon):
             remove_unreferenced: Remove unreferenced objects.
 
         """
+        if self.incremental and self.signature_coverages:
+            raise PyPdfError(
+                "compress_identical_objects() renumbers and rewrites objects "
+                "covered by an existing digital signature; it cannot be used in "
+                "incremental mode on a signed document."
+            )
         if remove_identicals != self._UNSET:
             deprecate_with_replacement("remove_identicals", "remove_duplicates", "7.0.0")
             assert isinstance(remove_identicals, bool)

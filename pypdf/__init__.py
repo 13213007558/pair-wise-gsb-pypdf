@@ -7,6 +7,7 @@ text and metadata from PDFs as well.
 You can read the full docs at https://pypdf.readthedocs.io/.
 """
 
+from ._calculation import CalculationPlan
 from ._configuration import Configuration, apply_configuration, get_configuration, overwrite_configuration
 from ._crypt_providers import crypt_provider
 from ._doc_common import DocumentInformation
@@ -33,6 +34,7 @@ _debug_versions = (
 
 __all__ = [
     "Configuration",
+    "CalculationPlan",
     "DocumentInformation",
     "ImageType",
     "ObjectDeletionFlag",

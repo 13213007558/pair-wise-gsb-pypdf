@@ -33,12 +33,16 @@ from abc import ABC, abstractmethod
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from datetime import datetime
 from typing import (
+    TYPE_CHECKING,
     Any,
     NoReturn,
     Optional,
     Union,
     cast,
 )
+
+if TYPE_CHECKING:
+    from ._calculation import CalculationPlan
 
 from ._configuration import get_configuration
 from ._encryption import Encryption
@@ -784,6 +788,35 @@ class PdfDocCommon(ABC):
             except KeyError:
                 # Field attribute is N/A or unknown, so don't write anything
                 pass
+
+    def get_calculation_plan(
+        self,
+        dependencies: Optional[Mapping[str, Iterable[str]]] = None,
+    ) -> "CalculationPlan":
+        """
+        Build a read-only calculation plan for the AcroForm fields.
+
+        The plan orders the form fields so that every field is calculated
+        after the fields it depends on. Dependencies are derived from the
+        AcroForm ``/CO`` (calculation order) array, the qualified field
+        names and the calculate (``/AA`` ``/C``) JavaScript actions; extra
+        dependencies may be declared through *dependencies*.
+
+        Building the plan never executes any script; use
+        :meth:`CalculationPlan.execute()<pypdf._calculation.CalculationPlan.execute>`
+        with an explicit adapter for that.
+
+        Args:
+            dependencies: Optional mapping of fully qualified field names
+                to the field names their calculation depends on.
+
+        Returns:
+            A :class:`CalculationPlan<pypdf._calculation.CalculationPlan>`.
+
+        """
+        from ._calculation import CalculationPlan
+
+        return CalculationPlan.from_pdf(self, dependencies=dependencies)
 
     def get_form_text_fields(self, full_qualified_name: bool = False) -> dict[str, Any]:
         """

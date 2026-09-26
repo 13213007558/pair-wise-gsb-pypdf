@@ -52,6 +52,7 @@ You can contribute to `pypdf on GitHub <https://github.com/py-pdf/pypdf>`_.
 
    modules/PdfReader
    modules/PdfWriter
+   modules/CalculationPlan
    modules/Destination
    modules/DocumentInformation
    modules/Field

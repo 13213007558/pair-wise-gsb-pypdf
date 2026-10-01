@@ -72,3 +72,14 @@ class LimitReachedError(PyPdfError):
 
 class XmpDocumentError(PyPdfError, RuntimeError):
     """Raised when the XMP XML document context is invalid or missing."""
+
+
+class RedactionError(PyPdfError):
+    """Raised when a redaction operation cannot be completed safely."""
+
+
+class RedactionNotSupportedError(RedactionError):
+    """
+    Raised when a document cannot be redacted at all, e.g. because it is
+    encrypted, digitally signed, or uses unsupported font encodings.
+    """

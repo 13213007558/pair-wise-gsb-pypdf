@@ -13,6 +13,7 @@ from ._doc_common import DocumentInformation
 from ._encryption import PasswordType
 from ._page import PageObject, Transformation
 from ._reader import PdfReader
+from ._redact import RedactionHit, RedactionReport, redact_and_sanitize
 from ._text_extraction import mult
 from ._version import __version__
 from ._writer import ObjectDeletionFlag, PdfWriter
@@ -42,6 +43,8 @@ __all__ = [
     "PasswordType",
     "PdfReader",
     "PdfWriter",
+    "RedactionHit",
+    "RedactionReport",
     "Transformation",
     "__version__",
     "_debug_versions",
@@ -50,4 +53,5 @@ __all__ = [
     "mult",
     "overwrite_configuration",
     "parse_filename_page_ranges",
+    "redact_and_sanitize",
 ]

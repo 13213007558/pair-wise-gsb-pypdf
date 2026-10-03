@@ -5,14 +5,14 @@ import sys
 import time
 from io import BytesIO
 from pathlib import Path
-from typing import Union
+from typing import Any, Union
 from unittest import mock
 
 import pytest
 
 from pypdf import PdfReader, PdfWriter
 from pypdf._crypt_providers import crypt_provider
-from pypdf._reader import convert_to_int
+from pypdf._reader import ObjectSourceKind, convert_to_int
 from pypdf.constants import ImageAttributes
 from pypdf.constants import PageAttributes as PG
 from pypdf.constants import UserAccessPermissions as UAP
@@ -37,6 +37,7 @@ from pypdf.generic import (
     PdfObject,
     StreamObject,
     TextStringObject,
+    read_object,
 )
 
 from . import RESOURCE_ROOT, SAMPLE_ROOT, get_data_from_url, normalize_warnings
@@ -2977,3 +2978,305 @@ def test_get_object_from_stream__read_object_raises_and_warns(caplog):
     assert cached[(0, 1)] is result
     assert "Invalid stream (index 0) within object 1 0: malformed stream" in caplog.text
     assert reader._object_stream_resolution_stack == []
+
+
+def _build_incremental_pdf() -> tuple[bytes, dict[str, int]]:
+    """
+    Build a base PDF plus two incremental updates, each redefining
+    object 2. Returns (data, offsets).
+    """
+    header = b"%PDF-1.4\n"
+    obj1 = b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n"
+
+    def obj2(version: bytes) -> bytes:
+        return (
+            b"2 0 obj\n<< /Type /Pages /Kids [] /Count 0 /Rev ("
+            + version
+            + b") >>\nendobj\n"
+        )
+
+    obj2_v1_offset = len(header) + len(obj1)
+    body = header + obj1 + obj2(b"v1")
+    xref1 = len(body)
+    rev1 = (
+        body
+        + b"xref\n0 3\n"
+        + b"0000000000 65535 f \n"
+        + f"{len(header):010d} 00000 n \n".encode()
+        + f"{obj2_v1_offset:010d} 00000 n \n".encode()
+        + b"trailer\n<< /Size 3 /Root 1 0 R >>\nstartxref\n"
+        + str(xref1).encode()
+        + b"\n%%EOF\n"
+    )
+
+    obj2_v2_offset = len(rev1)
+    body2 = rev1 + obj2(b"v2")
+    xref2 = len(body2)
+    rev2 = (
+        body2
+        + b"xref\n0 1\n0000000000 65535 f \n2 1\n"
+        + f"{obj2_v2_offset:010d} 00000 n \n".encode()
+        + b"trailer\n<< /Size 3 /Root 1 0 R /Prev "
+        + str(xref1).encode()
+        + b" >>\nstartxref\n"
+        + str(xref2).encode()
+        + b"\n%%EOF\n"
+    )
+
+    obj2_v3_offset = len(rev2)
+    body3 = rev2 + obj2(b"v3")
+    xref3 = len(body3)
+    data = (
+        body3
+        + b"xref\n0 1\n0000000000 65535 f \n2 1\n"
+        + f"{obj2_v3_offset:010d} 00000 n \n".encode()
+        + b"trailer\n<< /Size 3 /Root 1 0 R /Prev "
+        + str(xref2).encode()
+        + b" >>\nstartxref\n"
+        + str(xref3).encode()
+        + b"\n%%EOF\n"
+    )
+    offsets = {
+        "obj2_v1": obj2_v1_offset,
+        "obj2_v2": obj2_v2_offset,
+        "obj2_v3": obj2_v3_offset,
+        "xref3": xref3,
+    }
+    return data, offsets
+
+
+def _build_objstm_pdf() -> tuple[bytes, dict[str, int]]:
+    """
+    Build a PDF 1.5 file with a cross-reference stream and an object
+    stream (object 2) holding objects 5 and 6. Returns (data, offsets).
+    """
+    header = b"%PDF-1.5\n"
+    catalog = b"1 0 obj\n<< /Type /Catalog /Pages 3 0 R >>\nendobj\n"
+    obj5_body = b"<< /Name (five) >>"
+    obj6_body = b"[1 2 3]"
+    objstm_pairs = b"5 0 6 " + str(len(obj5_body) + 1).encode() + b" "
+    objstm_data = objstm_pairs + obj5_body + b" " + obj6_body
+    objstm = (
+        b"2 0 obj\n<< /Type /ObjStm /N 2 /First "
+        + str(len(objstm_pairs)).encode()
+        + b" /Length "
+        + str(len(objstm_data)).encode()
+        + b" >>\nstream\n"
+        + objstm_data
+        + b"\nendstream\nendobj\n"
+    )
+    pages = b"3 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n"
+
+    off1 = len(header)
+    off2 = off1 + len(catalog)
+    off3 = off2 + len(objstm)
+    off4 = off3 + len(pages)
+
+    def xref_entry(entry_type: int, field2: int, field3: int) -> bytes:
+        return (
+            bytes([entry_type])
+            + field2.to_bytes(4, "big")
+            + field3.to_bytes(2, "big")
+        )
+
+    entries = b"".join(
+        [
+            xref_entry(0, 0, 65535),
+            xref_entry(1, off1, 0),
+            xref_entry(1, off2, 0),
+            xref_entry(1, off3, 0),
+            xref_entry(1, off4, 0),
+            xref_entry(2, 2, 0),  # object 5: ObjStm 2, index 0
+            xref_entry(2, 2, 1),  # object 6: ObjStm 2, index 1
+        ]
+    )
+    xref_stream = (
+        b"4 0 obj\n<< /Type /XRef /Size 7 /Root 1 0 R /W [1 4 2] /Length "
+        + str(len(entries)).encode()
+        + b" >>\nstream\n"
+        + entries
+        + b"\nendstream\nendobj\n"
+    )
+    data = (
+        header
+        + catalog
+        + objstm
+        + pages
+        + xref_stream
+        + b"startxref\n"
+        + str(off4).encode()
+        + b"\n%%EOF\n"
+    )
+    offsets = {"obj1": off1, "objstm": off2, "obj3": off3, "xref_stream": off4}
+    return data, offsets
+
+
+def _corrupt_startxref(data: bytes) -> bytes:
+    """Replace the final startxref value with an out-of-range offset."""
+    start = data.rfind(b"startxref") + len(b"startxref\n")
+    end = data.index(b"\n", start)
+    return data[:start] + b"9" * (end - start) + data[end:]
+
+
+def test_get_object_source__uncompressed():
+    writer = PdfWriter()
+    writer.add_blank_page(612, 792)
+    stream = BytesIO()
+    writer.write(stream)
+    data = stream.getvalue()
+    stream.seek(0)
+    reader = PdfReader(stream)
+
+    root_ref = reader.trailer.raw_get("/Root")
+    source = reader.get_object_source(root_ref)
+    assert source.kind == ObjectSourceKind.UNCOMPRESSED
+    assert source.idnum == root_ref.idnum
+    assert source.generation == 0
+    # The reported offset points at the object header in the file.
+    assert data[source.file_offset:].startswith(
+        f"{root_ref.idnum} 0 obj".encode()
+    )
+    # The xref section is the classic table at the startxref position.
+    assert source.xref_section is not None
+    assert source.xref_section.kind == "table"
+    assert data[source.xref_section.offset:].startswith(b"xref")
+    assert source.recovery_reason is None
+
+    # An int is accepted as object number of generation 0.
+    assert (
+        reader.get_object_source(root_ref.idnum).file_offset == source.file_offset
+    )
+
+
+def test_get_object_source__incremental_updates():
+    data, offsets = _build_incremental_pdf()
+    reader = PdfReader(BytesIO(data))
+
+    source = reader.get_object_source(IndirectObject(2, 0, reader))
+    assert source.kind == ObjectSourceKind.UNCOMPRESSED
+    # The effective version is the one from the last incremental update.
+    assert source.file_offset == offsets["obj2_v3"]
+    assert data[source.file_offset:].startswith(b"2 0 obj")
+    assert b"/Rev (v3)" in data[source.file_offset:source.file_offset + 60]
+    assert source.xref_section is not None
+    assert source.xref_section.kind == "table"
+    assert source.xref_section.offset == offsets["xref3"]
+    # Consistent with what the reader actually resolves.
+    assert reader.get_object(IndirectObject(2, 0, reader))["/Rev"] == "v3"
+
+
+def test_get_object_source__object_stream():
+    data, offsets = _build_objstm_pdf()
+    reader = PdfReader(BytesIO(data))
+
+    source = reader.get_object_source(IndirectObject(5, 0, reader))
+    assert source.kind == ObjectSourceKind.OBJECT_STREAM
+    assert source.objstm_idnum == 2
+    assert source.objstm_index == 0
+    # The outer object stream's own position in the file is reported.
+    assert source.objstm_offset == offsets["objstm"]
+    assert data[source.objstm_offset:].startswith(b"2 0 obj")
+    assert source.xref_section is not None
+    assert source.xref_section.kind == "stream"
+    assert source.xref_section.offset == offsets["xref_stream"]
+    # The decoded offset locates the object within the decoded stream.
+    obj_stm = reader.get_object(IndirectObject(2, 0, reader))
+    decoded = obj_stm.get_data()
+    parsed = read_object(BytesIO(decoded[source.decoded_offset:]), reader)
+    assert parsed == reader.get_object(IndirectObject(5, 0, reader))
+
+    source6 = reader.get_object_source(IndirectObject(6, 0, reader))
+    assert source6.kind == ObjectSourceKind.OBJECT_STREAM
+    assert source6.objstm_index == 1
+    parsed6 = read_object(BytesIO(decoded[source6.decoded_offset:]), reader)
+    assert parsed6 == reader.get_object(IndirectObject(6, 0, reader))
+
+
+def test_get_object_source__recovered():
+    data, offsets = _build_incremental_pdf()
+    broken = _corrupt_startxref(data)
+    reader = PdfReader(BytesIO(broken))
+
+    source = reader.get_object_source(IndirectObject(2, 0, reader))
+    assert source.kind == ObjectSourceKind.RECOVERED
+    assert source.recovery_reason
+    # The reported offset still points at the effective object header.
+    assert source.file_offset == offsets["obj2_v3"]
+    assert data[source.file_offset:].startswith(b"2 0 obj")
+    assert reader.get_object(IndirectObject(2, 0, reader))["/Rev"] == "v3"
+
+
+def test_get_object_source__recovered_object_stream_member():
+    data, offsets = _build_objstm_pdf()
+    broken = _corrupt_startxref(data)
+    reader = PdfReader(BytesIO(broken))
+
+    source = reader.get_object_source(IndirectObject(5, 0, reader))
+    assert source.kind == ObjectSourceKind.RECOVERED
+    assert source.recovery_reason
+    assert source.objstm_idnum == 2
+    assert source.objstm_offset == offsets["objstm"]
+    obj_stm = reader.get_object(IndirectObject(2, 0, reader))
+    decoded = obj_stm.get_data()
+    parsed = read_object(BytesIO(decoded[source.decoded_offset:]), reader)
+    assert parsed == reader.get_object(IndirectObject(5, 0, reader))
+
+    catalog = reader.get_object_source(IndirectObject(1, 0, reader))
+    assert catalog.kind == ObjectSourceKind.RECOVERED
+    assert catalog.file_offset == offsets["obj1"]
+
+
+def test_get_object_source__not_applicable_and_not_found():
+    writer = PdfWriter()
+    writer.add_blank_page(612, 792)
+    stream = BytesIO()
+    writer.write(stream)
+    stream.seek(0)
+    reader = PdfReader(stream)
+
+    # A direct object (dictionary item) has no indirect location.
+    source = reader.get_object_source(reader.root_object)
+    assert source.kind == ObjectSourceKind.NOT_APPLICABLE
+    assert source.file_offset is None
+    assert source.idnum is None
+
+    # A reference the reader does not know about.
+    source = reader.get_object_source(IndirectObject(999, 0, reader))
+    assert source.kind == ObjectSourceKind.NOT_FOUND
+    assert source.idnum == 999
+
+
+class _CountingBytesIO(BytesIO):
+    def __init__(self, data: bytes) -> None:
+        super().__init__(data)
+        self.read_count = 0
+
+    def read(self, *args: Any, **kwargs: Any) -> Any:
+        self.read_count += 1
+        return super().read(*args, **kwargs)
+
+
+def test_get_object_source__is_read_only():
+    data, _offsets = _build_objstm_pdf()
+    stream = _CountingBytesIO(data)
+    reader = PdfReader(stream)
+    stream.read_count = 0
+    resolved_before = dict(reader.resolved_objects)
+    position = stream.tell()
+
+    # Querying an uncompressed object is a pure lookup: no I/O at all.
+    source = reader.get_object_source(IndirectObject(3, 0, reader))
+    assert source.kind == ObjectSourceKind.UNCOMPRESSED
+    assert stream.read_count == 0
+    assert stream.tell() == position
+    assert reader.resolved_objects == resolved_before
+
+    # Querying a compressed object decodes only its own object stream.
+    source5 = reader.get_object_source(IndirectObject(5, 0, reader))
+    assert source5.kind == ObjectSourceKind.OBJECT_STREAM
+    assert stream.tell() == position
+    assert set(reader.resolved_objects) - set(resolved_before) == {(0, 2)}
+
+    # Subsequent reads are unaffected.
+    assert reader.get_object(IndirectObject(5, 0, reader))["/Name"] == "five"
+    assert reader.get_object(IndirectObject(6, 0, reader)) == [1, 2, 3]

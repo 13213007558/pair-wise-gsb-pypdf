@@ -12,7 +12,7 @@ from ._crypt_providers import crypt_provider
 from ._doc_common import DocumentInformation
 from ._encryption import PasswordType
 from ._page import PageObject, Transformation
-from ._reader import PdfReader
+from ._reader import ObjectSource, ObjectSourceKind, PdfReader, XrefSectionInfo
 from ._text_extraction import mult
 from ._version import __version__
 from ._writer import ObjectDeletionFlag, PdfWriter
@@ -36,6 +36,8 @@ __all__ = [
     "DocumentInformation",
     "ImageType",
     "ObjectDeletionFlag",
+    "ObjectSource",
+    "ObjectSourceKind",
     "PageObject",
     "PageRange",
     "PaperSize",
@@ -43,6 +45,7 @@ __all__ = [
     "PdfReader",
     "PdfWriter",
     "Transformation",
+    "XrefSectionInfo",
     "__version__",
     "_debug_versions",
     "apply_configuration",

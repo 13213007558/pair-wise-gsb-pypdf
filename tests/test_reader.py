@@ -1124,6 +1124,274 @@ def test_get_object():
     assert reader._get_indirect_object(22, 0)["/Type"] == "/Catalog"
 
 
+def _write_incremental_xref_stream(
+    buf: BytesIO,
+    entries: list[tuple[int, int, int]],
+    xref_object_number: int,
+    size: int,
+    previous_xref: Union[int, None] = None,
+) -> int:
+    xref_offset = buf.tell()
+    entries = [*entries, (1, xref_offset, 0)]
+    data = bytearray()
+    for entry_type, value, generation in entries:
+        data.append(entry_type)
+        data.extend(value.to_bytes(4, "big"))
+        data.extend(generation.to_bytes(2, "big"))
+    dictionary = f"<< /Type /XRef /Size {size} /W [1 4 2] /Root 1 0 R /Length {len(data)}"
+    if previous_xref is not None:
+        dictionary += f" /Prev {previous_xref}"
+    dictionary += " >>"
+    buf.write(f"{xref_object_number} 0 obj\n".encode())
+    buf.write(dictionary.encode())
+    buf.write(b"\nstream\n")
+    buf.write(bytes(data))
+    buf.write(b"\nendstream\nendobj\n")
+    buf.write(f"startxref\n{xref_offset}\n%%EOF\n".encode())
+    return xref_offset
+
+
+def test_get_object_source_incremental_object_stream() -> None:
+    def write_object(number: int, value: bytes) -> int:
+        offset = buf.tell()
+        buf.write(f"{number} 0 obj\n".encode() + value + b"\nendobj\n")
+        return offset
+
+    def write_object_stream(number: int, objects: list[tuple[int, bytes]]) -> tuple[int, bytes]:
+        index = bytearray()
+        payload = bytearray()
+        offset = 0
+        for object_number, value in objects:
+            pair = f"{object_number} {offset} ".encode()
+            index.extend(pair)
+            payload.extend(value)
+            payload.extend(b" ")
+            offset += len(value) + 1
+        first = len(index)
+        stream_data = bytes(index + payload)
+        offset = buf.tell()
+        buf.write(f"{number} 0 obj\n".encode())
+        buf.write(
+            f"<< /Type /ObjStm /N {len(objects)} /First {first} /Length {len(stream_data)} >>\n".encode()
+        )
+        buf.write(b"stream\n" + stream_data + b"\nendstream\nendobj\n")
+        return offset, stream_data
+
+    buf = BytesIO()
+    buf.write(b"%PDF-1.5\n")
+    catalog_offset = write_object(1, b"<< /Type /Catalog /Pages 2 0 R /MarkInfo 4 0 R >>")
+    pages_offset = write_object(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")
+    page_offset = write_object(3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>")
+    old_mark_offset = write_object(4, b"<< /Marked false /Version (old) >>")
+    old_extra_offset = write_object(5, b"<< /Name (old extra) >>")
+    first_xref = _write_incremental_xref_stream(
+        buf,
+        [
+            (0, 0, 65535),
+            (1, catalog_offset, 0),
+            (1, pages_offset, 0),
+            (1, page_offset, 0),
+            (1, old_mark_offset, 0),
+            (1, old_extra_offset, 0),
+        ],
+        xref_object_number=6,
+        size=7,
+    )
+
+    updated_page_offset = write_object(3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] >>")
+    first_update_xref = _write_incremental_xref_stream(
+        buf,
+        [
+            (0, 0, 65535),
+            (1, catalog_offset, 0),
+            (1, pages_offset, 0),
+            (1, updated_page_offset, 0),
+            (1, old_mark_offset, 0),
+            (1, old_extra_offset, 0),
+            (1, first_xref, 0),
+        ],
+        xref_object_number=8,
+        size=9,
+        previous_xref=first_xref,
+    )
+
+    object_stream_offset, object_stream_data = write_object_stream(
+        9,
+        [
+            (4, b"<< /Marked true /Version (new) >>"),
+            (5, b"<< /Name (new extra) >>"),
+        ],
+    )
+    second_update_xref = _write_incremental_xref_stream(
+        buf,
+        [
+            (0, 0, 65535),
+            (1, catalog_offset, 0),
+            (1, pages_offset, 0),
+            (1, updated_page_offset, 0),
+            (2, 9, 0),
+            (2, 9, 1),
+            (1, first_xref, 0),
+            (1, first_update_xref, 0),
+            (1, object_stream_offset, 0),
+        ],
+        xref_object_number=10,
+        size=11,
+        previous_xref=first_update_xref,
+    )
+
+    reader = PdfReader(BytesIO(buf.getvalue()))
+    stream = reader.stream
+    assert reader.get_object(3)["/MediaBox"][2] == 200
+    assert reader.cache_get_indirect_object(0, 4) is None
+    assert reader.cache_get_indirect_object(0, 5) is None
+
+    normal_source = reader.get_object_source(3)
+    assert normal_source.kind == "uncompressed"
+    assert normal_source.xref_type == "cross_reference_stream"
+    assert normal_source.xref_offset == second_update_xref
+    assert normal_source.xref_object_number == 10
+    assert normal_source.offset == updated_page_offset
+    assert normal_source.object_stream_number is None
+    data = buf.getvalue()
+    stream.seek(321)
+    assert data[normal_source.offset :].startswith(b"3 0 obj")
+
+    compressed_source = reader.get_object_source(5)
+    assert compressed_source.kind == "compressed"
+    assert compressed_source.xref_offset == second_update_xref
+    assert compressed_source.xref_object_number == 10
+    assert compressed_source.offset is None
+    assert compressed_source.object_stream_number == 9
+    assert compressed_source.object_stream_index == 1
+    assert compressed_source.object_stream_offset == object_stream_offset
+    assert data[object_stream_offset :].startswith(b"9 0 obj")
+    assert object_stream_data[compressed_source.decoded_offset :].startswith(
+        b"<< /Name (new extra) >>"
+    )
+    assert stream.tell() == 321
+    assert reader.get_object_source(1).offset == catalog_offset
+    assert reader.cache_get_indirect_object(0, 4) is None
+    assert reader.cache_get_indirect_object(0, 5) is None
+    assert reader.get_object(4)["/Version"] == "new"
+
+    direct_source = reader.get_object_source(reader.get_object(4)["/Version"])
+    assert direct_source.kind == "not_applicable"
+    assert direct_source.offset is None
+
+
+def test_get_object_source_recovered_from_scan() -> None:
+    buf = BytesIO()
+    buf.write(b"%PDF-1.4\n")
+    object_offset = buf.tell()
+    buf.write(b"1 0 obj\n<< /Type /Catalog /V 42 >>\nendobj\n")
+    xref_offset = buf.tell()
+    buf.write(
+        b"xref\n0 2\n"
+        b"0000000000 65535 f \n"
+        b"0000000010 00000 n \n"
+        b"trailer\n<< /Size 2 /Root 1 0 R >>\n"
+        b"startxref\n"
+        + str(xref_offset).encode()
+        + b"\n%%EOF\n"
+    )
+
+    reader = PdfReader(BytesIO(buf.getvalue()))
+    assert reader.get_object(1)["/V"] == 42
+    source = reader.get_object_source(1)
+    assert source.kind == "recovered"
+    assert source.recovered is True
+    assert source.offset == object_offset
+    assert source.xref_type == "table"
+    assert source.xref_offset == xref_offset
+    assert "scanning" in source.recovery_reason
+    assert buf.getvalue()[source.offset :].startswith(b"1 0 obj")
+
+    prefix = b"garbage"
+    rebuilt = PdfReader(BytesIO(prefix + buf.getvalue()))
+    assert rebuilt.get_object(1)["/V"] == 42
+    rebuilt_source = rebuilt.get_object_source(1)
+    assert rebuilt_source.kind == "recovered"
+    assert rebuilt_source.recovered is True
+    assert rebuilt_source.xref_type == "recovery_scan"
+    assert rebuilt_source.xref_offset is None
+    assert rebuilt_source.offset == object_offset + len(prefix)
+
+
+def test_get_object_source_recovered_compressed_object() -> None:
+    objstm_data = b"4 0 << /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>"
+    buf = BytesIO()
+    buf.write(b"%PDF-1.5\n")
+    catalog_offset = buf.tell()
+    buf.write(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n")
+    pages_offset = buf.tell()
+    buf.write(b"2 0 obj\n<< /Type /Pages /Kids [4 0 R] /Count 1 >>\nendobj\n")
+    objstm_number = 3
+    objstm_offset = buf.tell()
+    buf.write(
+        b"3 0 obj\n"
+        b"<< /Type /ObjStm /N 1 /First 4 /Length "
+        + str(len(objstm_data)).encode()
+        + b" >>\nstream\n"
+        + objstm_data
+        + b"\nendstream\nendobj\n"
+    )
+    xref_offset = buf.tell()
+    buf.write(b"xref\n0 4\n0000000000 65535 f \n")
+    buf.write(f"{catalog_offset:010d} 00000 n \n".encode())
+    buf.write(f"{pages_offset:010d} 00000 n \n".encode())
+    buf.write(b"0000000001 00000 n \n")
+    buf.write(b"trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n")
+    buf.write(str(xref_offset).encode() + b"\n%%EOF\n")
+
+    prefix = b"prefix"
+    reader = PdfReader(BytesIO(prefix + buf.getvalue()))
+    source = reader.get_object_source(4)
+    assert source.kind == "recovered"
+    assert source.recovered is True
+    assert source.xref_type == "recovery_scan"
+    assert source.offset is None
+    assert source.object_stream_number == objstm_number
+    assert source.object_stream_index == 0
+    assert source.object_stream_offset == objstm_offset + len(prefix)
+    assert source.decoded_offset == 4
+    assert reader.get_object(4)["/Type"] == "/Page"
+
+
+def test_get_object_source_restores_position_and_remains_lazy() -> None:
+    buf = BytesIO()
+    buf.write(b"%PDF-1.4\n")
+    object_offset = buf.tell()
+    buf.write(b"1 0 obj\n<< /Type /Catalog /V 42 >>\nendobj\n")
+    xref_offset = buf.tell()
+    buf.write(
+        b"xref\n0 2\n"
+        + b"0000000000 65535 f \n"
+        + (f"{object_offset:010d}" + " 00000 n \n").encode()
+        + b"trailer\n<< /Size 2 /Root 1 0 R >>\n"
+        + b"startxref\n"
+        + str(xref_offset).encode()
+        + b"\n%%EOF\n"
+    )
+
+    stream = BytesIO(buf.getvalue())
+    reader = PdfReader(stream)
+    stream.seek(123, 0)
+    with mock.patch.object(reader, "_rebuild_xref_table") as rebuild:
+        source = reader.get_object_source(1)
+        assert source.offset == object_offset
+        assert rebuild.call_count == 0
+    assert stream.tell() == 123
+    assert reader.cache_get_indirect_object(0, 1) is None
+
+    assert reader.get_object(1)["/V"] == 42
+    stream.seek(456, 0)
+    with mock.patch("pypdf._reader.read_object") as read_object_mock:
+        reader.get_object_source(1)
+        read_object_mock.assert_not_called()
+    assert stream.tell() == 456
+
+
 def test_extract_text_hello_world():
     reader = PdfReader(RESOURCE_ROOT / "hello-world.pdf")
     text = reader.pages[0].extract_text().split("\n")
@@ -2670,7 +2938,12 @@ def test_load_recovery_cache():
         (3, 1, 42),
     ]
     with mock.patch.object(reader, "_find_pdf_objects", return_value=iter(pdf_objects)):
-        assert reader._load_recovery_cache(b"") == {1: (10, 0), 2: (30, 0), 3: (42, 1)}
+        assert reader._load_recovery_cache(b"") == {
+            (1, 0): (10, 0),
+            (1, 1): (20, 1),
+            (2, 0): (30, 0),
+            (3, 1): (42, 1),
+        }
 
 
 def test_flatten_rejects_typeless_non_page_kid_strict():

@@ -31,6 +31,7 @@ import os
 import re
 import sys
 from collections.abc import Iterable
+from dataclasses import dataclass, replace
 from io import BytesIO, UnsupportedOperation
 from operator import itemgetter
 from pathlib import Path
@@ -39,6 +40,7 @@ from typing import (
     TYPE_CHECKING,
     Any,
     Callable,
+    Literal,
     Optional,
     Union,
     cast,
@@ -93,6 +95,60 @@ if TYPE_CHECKING:
     from ._page import PageObject
 
 
+@dataclass(frozen=True)
+class ObjectSource:
+    """Location and cross-reference provenance of one indirect object."""
+
+    object_number: Optional[int]
+    generation: Optional[int]
+    kind: Literal["uncompressed", "compressed", "recovered", "not_applicable"]
+    xref_type: Optional[str] = None
+    xref_offset: Optional[int] = None
+    xref_object_number: Optional[int] = None
+    file_offset: Optional[int] = None
+    object_stream_number: Optional[int] = None
+    object_stream_index: Optional[int] = None
+    object_stream_file_offset: Optional[int] = None
+    decoded_offset: Optional[int] = None
+    recovered: bool = False
+    recovery_reason: Optional[str] = None
+
+    @property
+    def offset(self) -> Optional[int]:
+        return self.file_offset
+
+    @property
+    def object_stream_offset(self) -> Optional[int]:
+        return self.object_stream_file_offset
+
+    @property
+    def is_compressed(self) -> bool:
+        return self.kind == "compressed" or (
+            self.recovered and self.object_stream_number is not None
+        )
+
+    @property
+    def is_recovered(self) -> bool:
+        return self.recovered
+
+    @property
+    def applicable(self) -> bool:
+        return self.kind != "not_applicable"
+
+    def __getitem__(self, key: str) -> object:
+        try:
+            return getattr(self, key)
+        except AttributeError as exc:
+            raise KeyError(key) from exc
+
+
+@dataclass(frozen=True)
+class _XrefSegment:
+    kind: Literal["table", "cross_reference_stream", "recovery_scan"]
+    offset: Optional[int]
+    object_number: Optional[int] = None
+
+
 class PdfReader(PdfDocCommon):
     """
     Initialize a PdfReader object.
@@ -135,6 +191,8 @@ class PdfReader(PdfDocCommon):
         self.xref: dict[int, dict[Any, Any]] = {}
         self.xref_free_entry: dict[int, dict[Any, Any]] = {}
         self.xref_objStm: dict[int, tuple[Any, Any]] = {}
+        self.xref_object_sources: dict[tuple[int, int], ObjectSource] = {}
+        self._object_stream_offsets: dict[int, dict[int, tuple[int, int]]] = {}
         self.trailer = DictionaryObject()
 
         # Security parameters.
@@ -217,6 +275,8 @@ class PdfReader(PdfDocCommon):
         self.xref = {}
         self.xref_free_entry = {}
         self.xref_objStm = {}
+        self.xref_object_sources = {}
+        self._object_stream_offsets = {}
 
     @property
     def root_object(self) -> DictionaryObject:
@@ -413,6 +473,10 @@ class PdfReader(PdfDocCommon):
                 read_non_whitespace(stream_data)
                 stream_data.seek(-1, 1)
                 obj_index.append((int(objnum), int(offset)))
+            self._object_stream_offsets[stmnum] = {
+                objnum: (index, first_offset + offset)
+                for index, (objnum, offset) in enumerate(obj_index)
+            }
 
             # Phase 2: Parse each object and cache it.
             target_obj: PdfObject = NullObject()
@@ -469,6 +533,136 @@ class PdfReader(PdfDocCommon):
         finally:
             self._object_stream_resolution_stack.pop()
 
+    def _get_object_stream_location(
+        self, indirect_reference: IndirectObject
+    ) -> tuple[int, int, int, int]:
+        object_stream_number, declared_index = self.xref_objStm[indirect_reference.idnum]
+        offsets = self._object_stream_offsets.get(object_stream_number)
+        if offsets is not None and indirect_reference.idnum in offsets:
+            actual_index, decoded_offset = offsets[indirect_reference.idnum]
+            container_source = self.get_object_source(
+                IndirectObject(object_stream_number, 0, self)
+            )
+            if container_source.offset is None:
+                raise PdfReadError(
+                    f"Object stream {object_stream_number} has no original file offset."
+                )
+            return (
+                object_stream_number,
+                actual_index,
+                container_source.offset,
+                decoded_offset,
+            )
+
+        object_stream = IndirectObject(object_stream_number, 0, self).get_object()
+        if not isinstance(object_stream, (StreamObject, EncodedStreamObject)):
+            raise PdfReadError(
+                f"Compressed object {indirect_reference.idnum} references non-stream object "
+                f"{object_stream_number}."
+            )
+        if offsets is None:  # pragma: no branch
+            stream_data = BytesIO(object_stream.get_data())
+            n = int(object_stream["/N"])
+            max_n = stream_data.getbuffer().nbytes // 3
+            if n > max_n:
+                if self.strict:
+                    raise LimitReachedError(
+                        f"Value /N {n} for object {object_stream_number} exceeds maximum "
+                        f"allowed value {max_n}."
+                    )
+                n = max_n
+            offsets = {}
+            for index in range(n):
+                read_non_whitespace(stream_data)
+                stream_data.seek(-1, 1)
+                object_number = int(NumberObject.read_from_stream(stream_data))
+                read_non_whitespace(stream_data)
+                stream_data.seek(-1, 1)
+                stream_offset = int(NumberObject.read_from_stream(stream_data))
+                offsets[object_number] = (
+                    index,
+                    int(object_stream["/First"]) + stream_offset,
+                )
+            self._object_stream_offsets[object_stream_number] = offsets
+
+        if indirect_reference.idnum not in offsets:
+            if self.strict:
+                raise PdfReadError(
+                    f"Object {indirect_reference.idnum} not found in object stream "
+                    f"{object_stream_number}."
+                )
+            return object_stream_number, declared_index, -1, -1
+
+        actual_index, decoded_offset = offsets[indirect_reference.idnum]
+        container_source = self.get_object_source(
+            IndirectObject(object_stream_number, 0, self)
+        )
+        if container_source.offset is None:
+            raise PdfReadError(
+                f"Object stream {object_stream_number} has no original file offset."
+            )
+        return (
+            object_stream_number,
+            actual_index,
+            container_source.offset,
+            decoded_offset,
+        )
+
+    def get_object_source(
+        self, indirect_reference: Union[int, IndirectObject, PdfObject]
+    ) -> ObjectSource:
+        """
+        Return where the effective version of an object is stored.
+
+        This method does not resolve the referenced object. Compressed objects
+        only decode their containing object stream's object-number/offset
+        header and locate that outer object's ordinary file offset.
+        """
+        position = self.stream.tell()
+        try:
+            if isinstance(indirect_reference, int):
+                indirect_reference = IndirectObject(indirect_reference, 0, self)
+            elif not isinstance(indirect_reference, IndirectObject):
+                return ObjectSource(
+                    object_number=None,
+                    generation=None,
+                    kind="not_applicable",
+                    recovery_reason="Direct object values do not have independent indirect object locations.",
+                )
+
+            if indirect_reference.pdf is not self:
+                raise ValueError("Cannot query an indirect object from another PDF")
+
+            key = (indirect_reference.generation, indirect_reference.idnum)
+            source = self.xref_object_sources.get(key)
+            if source is None:
+                if self.cache_get_indirect_object(*key) is not None:
+                    raise PdfReadError(
+                        f"Object {indirect_reference.idnum} {indirect_reference.generation} "
+                        "has no recorded source."
+                    )
+                raise PdfReadError(
+                    f"Object {indirect_reference.idnum} {indirect_reference.generation} "
+                    "is not present in the cross-reference tables."
+                )
+
+            if source.kind == "compressed" or (
+                source.recovered and source.object_stream_number is not None
+            ):
+                stream_number, index, stream_offset, decoded_offset = (
+                    self._get_object_stream_location(indirect_reference)
+                )
+                source = replace(
+                    source,
+                    object_stream_number=stream_number,
+                    object_stream_index=index,
+                    object_stream_file_offset=stream_offset,
+                    decoded_offset=decoded_offset,
+                )
+            return source
+        finally:
+            self.stream.seek(position, 0)
+
     def get_object(
         self, indirect_reference: Union[int, IndirectObject]
     ) -> Optional[PdfObject]:
@@ -494,6 +688,7 @@ class PdfReader(PdfDocCommon):
                 return NullObject()
             start = self.xref[indirect_reference.generation][indirect_reference.idnum]
             self.stream.seek(start, 0)
+            original_start = start
             try:
                 idnum, generation = self.read_object_header(self.stream)
                 if (
@@ -523,6 +718,25 @@ class PdfReader(PdfDocCommon):
                     self.xref[indirect_reference.generation][
                         indirect_reference.idnum
                     ] = (m.start(0) + 1)
+                    old_source = self.xref_object_sources.get(
+                        (indirect_reference.generation, indirect_reference.idnum)
+                    )
+                    self.xref_object_sources[
+                        (indirect_reference.generation, indirect_reference.idnum)
+                    ] = ObjectSource(
+                        object_number=indirect_reference.idnum,
+                        generation=indirect_reference.generation,
+                        kind="recovered",
+                        xref_type=old_source.xref_type if old_source else None,
+                        xref_offset=old_source.xref_offset if old_source else None,
+                        xref_object_number=old_source.xref_object_number if old_source else None,
+                        file_offset=m.start(0) + 1,
+                        recovered=True,
+                        recovery_reason=(
+                            f"Cross-reference offset {original_start} did not identify the object; "
+                            "object found by scanning."
+                        ),
+                    )
                     self.stream.seek(m.start(0) + 1)
                     idnum, generation = self.read_object_header(self.stream)
                 else:
@@ -586,6 +800,27 @@ class PdfReader(PdfDocCommon):
                     self.xref[indirect_reference.generation] = {}
                 self.xref[indirect_reference.generation][indirect_reference.idnum] = (
                     m.start(0) + 1
+                )
+                old_source = self.xref_object_sources.get(
+                    (indirect_reference.generation, indirect_reference.idnum)
+                )
+                self.xref_object_sources[
+                    (indirect_reference.generation, indirect_reference.idnum)
+                ] = ObjectSource(
+                    object_number=indirect_reference.idnum,
+                    generation=indirect_reference.generation,
+                    kind="recovered",
+                    xref_type=old_source.xref_type if old_source else "recovery_scan",
+                    xref_offset=old_source.xref_offset if old_source else None,
+                    xref_object_number=(
+                        old_source.xref_object_number if old_source else None
+                    ),
+                    file_offset=m.start(0) + 1,
+                    recovered=True,
+                    recovery_reason=(
+                        "Cross-reference entry was absent or invalid when the object was resolved; "
+                        "object found by scanning."
+                    ),
                 )
                 self.stream.seek(m.end(0) + 1)
                 skip_over_whitespace(self.stream)
@@ -739,6 +974,12 @@ class PdfReader(PdfDocCommon):
                     if pid == id - self.xref_index:
                         # fixing index item per item is required for revised PDF.
                         self.xref[gen][pid] = self.xref[gen][id]
+                        source = self.xref_object_sources.get((gen, id))
+                        if source is not None:
+                            self.xref_object_sources[(gen, pid)] = replace(
+                                source, object_number=pid
+                            )
+                            del self.xref_object_sources[(gen, id)]
                         del self.xref[gen][id]
                     # if not, then either it's just plain wrong, or the
                     # non-zero-index is actually correct
@@ -762,6 +1003,25 @@ class PdfReader(PdfDocCommon):
                             id=id,
                             gen=gen,
                             offset=xref_entry[id],
+                        )
+                        invalid_source = self.xref_object_sources.get((gen, id))
+                        self.xref_object_sources[(gen, id)] = ObjectSource(
+                            object_number=id,
+                            generation=gen,
+                            kind="recovered",
+                            xref_type=invalid_source.xref_type if invalid_source else None,
+                            xref_offset=invalid_source.xref_offset if invalid_source else None,
+                            xref_object_number=(
+                                invalid_source.xref_object_number
+                                if invalid_source
+                                else None
+                            ),
+                            file_offset=None,
+                            recovered=True,
+                            recovery_reason=(
+                                f"Cross-reference offset {xref_entry[id]} did not identify "
+                                "the object; recovery is required to locate it."
+                            ),
                         )
                         del xref_entry[id]  # we can delete the id, we are parsing ids
             stream.seek(loc, 0)  # return to where it was
@@ -917,16 +1177,20 @@ class PdfReader(PdfDocCommon):
             break
         raise PdfReadError("startxref not found")
 
-    def _load_recovery_cache(self, data: bytes) -> dict[int, tuple[int, int]]:
+    def _load_recovery_cache(
+        self, data: bytes
+    ) -> dict[tuple[int, int], tuple[int, int]]:
         cache = {}
         for object_number, generation_number, object_start in self._find_pdf_objects(data):
-            if object_number in cache:
-                # Always use the first match.
-                continue
-            cache[object_number] = (object_start, generation_number)
+            key = (object_number, generation_number)
+            # Scanning is in byte order; later appended revisions override
+            # earlier definitions with the same object number and generation.
+            cache[key] = (object_start, generation_number)
         return cache
 
-    def _read_standard_xref_table(self, stream: StreamType) -> None:
+    def _read_standard_xref_table(
+        self, stream: StreamType, segment: _XrefSegment
+    ) -> None:
         # standard cross-reference table
         ref = stream.read(3)
         if ref != b"ref":
@@ -934,7 +1198,7 @@ class PdfReader(PdfDocCommon):
         read_non_whitespace(stream)
         stream.seek(-1, 1)
         first_time = True  # check if the first time looking at the xref table
-        recovery_cache: Optional[dict[int, tuple[int, int]]] = None
+        recovery_cache: Optional[dict[tuple[int, int], tuple[int, int]]] = None
         while True:
             num = cast(int, read_object(stream, self))
             if first_time and num != 0:
@@ -962,6 +1226,7 @@ class PdfReader(PdfDocCommon):
             stream.seek(-1, 1)
             cnt = 0
             while cnt < size:
+                entry_recovered = False
                 line = stream.read(20)
                 if not line:
                     raise PdfReadError("Unexpected empty line in Xref table.")
@@ -1002,7 +1267,8 @@ class PdfReader(PdfDocCommon):
                     if recovery_cache is None:
                         recovery_cache = self._load_recovery_cache(buf)
 
-                    if num not in recovery_cache:
+                    cache_key = (num, 0)
+                    if cache_key not in recovery_cache:
                         logger_warning(
                             "entry %(num)d in Xref table invalid; object not found",
                             source=__name__,
@@ -1017,8 +1283,10 @@ class PdfReader(PdfDocCommon):
                             source=__name__,
                             num=num,
                         )
-                        generation, offset = recovery_cache[num]
+                        recovered_offset, generation = recovery_cache[cache_key]
+                        offset = recovered_offset
                         entry_type_b = b"n"
+                        entry_recovered = True
 
                 if generation not in self.xref:
                     self.xref[generation] = {}
@@ -1032,6 +1300,22 @@ class PdfReader(PdfDocCommon):
                 else:
                     if entry_type_b == b"n":
                         self.xref[generation][num] = offset
+                        source = ObjectSource(
+                            object_number=num,
+                            generation=generation,
+                            kind="recovered" if entry_recovered else "uncompressed",
+                            xref_type=segment.kind,
+                            xref_offset=segment.offset,
+                            xref_object_number=segment.object_number,
+                            file_offset=offset,
+                            recovered=entry_recovered,
+                            recovery_reason=(
+                                "Invalid cross-reference table entry; object found by scanning."
+                                if entry_recovered
+                                else None
+                            ),
+                        )
+                        self.xref_object_sources[(generation, num)] = source
                     try:
                         self.xref_free_entry[generation][num] = entry_type_b == b"f"
                     except Exception:
@@ -1067,6 +1351,8 @@ class PdfReader(PdfDocCommon):
         self.xref = {}
         self.xref_free_entry = {}
         self.xref_objStm = {}
+        self.xref_object_sources = {}
+        self._object_stream_offsets = {}
         self.trailer = DictionaryObject()
         visited_xref_offsets: set[int] = set()
         while startxref is not None:
@@ -1085,7 +1371,8 @@ class PdfReader(PdfDocCommon):
             if x in b"\r\n":
                 x = stream.read(1)
             if x == b"x":
-                startxref = self._read_xref(stream)
+                segment = _XrefSegment("table", startxref)
+                startxref = self._read_xref(stream, segment)
             elif xref_issue_nr:
                 try:
                     self._rebuild_xref_table(stream)
@@ -1093,8 +1380,9 @@ class PdfReader(PdfDocCommon):
                 except Exception:
                     xref_issue_nr = 0
             elif x.isdigit():
+                segment = _XrefSegment("cross_reference_stream", startxref)
                 try:
-                    xrefstream = self._read_pdf15_xref_stream(stream)
+                    xrefstream = self._read_pdf15_xref_stream(stream, segment)
                 except Exception as e:
                     if TK.ROOT in self.trailer:
                         logger_warning(
@@ -1123,12 +1411,15 @@ class PdfReader(PdfDocCommon):
                 self.trailer[NameObject(key)] = xrefstream.raw_get(key)
         if "/XRefStm" in xrefstream:
             p = self.stream.tell()
-            self.stream.seek(cast(int, xrefstream["/XRefStm"]) + 1, 0)
-            self._read_pdf15_xref_stream(self.stream)
+            xrefstm_offset = cast(int, xrefstream["/XRefStm"])
+            self.stream.seek(xrefstm_offset, 0)
+            self._read_pdf15_xref_stream(
+                self.stream, _XrefSegment("cross_reference_stream", xrefstm_offset)
+            )
             self.stream.seek(p, 0)
 
-    def _read_xref(self, stream: StreamType) -> Optional[int]:
-        self._read_standard_xref_table(stream)
+    def _read_xref(self, stream: StreamType, segment: _XrefSegment) -> Optional[int]:
+        self._read_standard_xref_table(stream, segment)
         if stream.read(1) == b"":
             return None
         stream.seek(-1, 1)
@@ -1140,9 +1431,13 @@ class PdfReader(PdfDocCommon):
                 self.trailer[key] = value
         if "/XRefStm" in new_trailer:
             p = stream.tell()
-            stream.seek(cast(int, new_trailer["/XRefStm"]) + 1, 0)
+            xrefstm_offset = cast(int, new_trailer["/XRefStm"])
+            stream.seek(xrefstm_offset, 0)
+            xrefstm_segment = _XrefSegment(
+                "cross_reference_stream", xrefstm_offset
+            )
             try:
-                self._read_pdf15_xref_stream(stream)
+                self._read_pdf15_xref_stream(stream, xrefstm_segment)
             except Exception:
                 logger_warning(
                     "XRef object at %(xref_stm)d can not be read, some object may be missing",
@@ -1240,10 +1535,13 @@ class PdfReader(PdfDocCommon):
 
         return result
 
-    def _read_pdf15_xref_stream(self, stream: StreamType) -> StreamObject:
+    def _read_pdf15_xref_stream(
+        self, stream: StreamType, segment: _XrefSegment
+    ) -> StreamObject:
         """Read the cross-reference stream for PDF 1.5+."""
         stream.seek(-1, 1)
         stream_idnum, stream_generation = self.read_object_header(stream)
+        segment = replace(segment, object_number=stream_idnum)
         xref_stream = cast(StreamObject, read_object(stream, self))
         if cast(str, xref_stream["/Type"]) != "/XRef":
             raise PdfReadError(f"Unexpected type {xref_stream['/Type']!r}")
@@ -1284,7 +1582,7 @@ class PdfReader(PdfDocCommon):
             return num in self.xref.get(generation, []) or num in self.xref_objStm  # type: ignore[arg-type]
 
         # Iterate through each subsection
-        self._read_xref_subsections(index_pairs, get_entry, used_before)
+        self._read_xref_subsections(index_pairs, get_entry, used_before, segment)
         return xref_stream
 
     @staticmethod
@@ -1386,6 +1684,9 @@ class PdfReader(PdfDocCommon):
 
     def _rebuild_xref_table(self, stream: StreamType) -> None:
         self.xref = {}
+        self.xref_objStm = {}
+        self.xref_object_sources = {}
+        self._object_stream_offsets = {}
         stream.seek(0, 0)
         stream_data = stream.read(-1)
 
@@ -1393,6 +1694,16 @@ class PdfReader(PdfDocCommon):
             if generation_number not in self.xref:
                 self.xref[generation_number] = {}
             self.xref[generation_number][object_number] = object_start
+            self.xref_object_sources[(generation_number, object_number)] = ObjectSource(
+                object_number=object_number,
+                generation=generation_number,
+                kind="recovered",
+                xref_type="recovery_scan",
+                xref_offset=None,
+                file_offset=object_start,
+                recovered=True,
+                recovery_reason="Cross-reference table was unavailable or invalid; object found by scanning.",
+            )
 
         logger_warning("parsing for Object Streams", source=__name__)
         # PDF 1.5+ files may carry the trailer keys inside a cross-reference
@@ -1434,7 +1745,32 @@ class PdfReader(PdfDocCommon):
                         if not current.isdigit():  # pragma: no cover
                             break  # pragma: no cover
                         inner_offset = int(current)
+                        existing = self.xref_objStm.get(inner_object_number)
                         self.xref_objStm[inner_object_number] = (object_number, inner_offset)
+                        source = ObjectSource(
+                            object_number=inner_object_number,
+                            generation=0,
+                            kind="recovered",
+                            xref_type="recovery_scan",
+                            xref_offset=None,
+                            object_stream_number=object_number,
+                            object_stream_index=actual_count,
+                            object_stream_file_offset=None,
+                            decoded_offset=int(obj["/First"]) + inner_offset,
+                            recovered=True,
+                            recovery_reason=(
+                                "Cross-reference table was unavailable or invalid; "
+                                "object stream found by scanning."
+                            ),
+                        )
+                        self.xref_object_sources[(0, inner_object_number)] = source
+                        if existing is not None:
+                            self._object_stream_offsets.get(existing[0], {}).pop(
+                                inner_object_number, None
+                            )
+                        self._object_stream_offsets.setdefault(object_number, {})[
+                            inner_object_number
+                        ] = (actual_count, int(obj["/First"]) + inner_offset)
                         actual_count += 1
                     expected_count = cast(int, obj["/N"])
                     if actual_count != expected_count:  # pragma: no cover
@@ -1472,6 +1808,7 @@ class PdfReader(PdfDocCommon):
         idx_pairs: list[int],
         get_entry: Callable[[int], Union[int, tuple[int, ...]]],
         used_before: Callable[[int, Union[int, tuple[int, ...]]], bool],
+        segment: _XrefSegment,
     ) -> None:
         """Read and process the subsections of the xref."""
         for start, size in self._pairs(idx_pairs):
@@ -1492,6 +1829,15 @@ class PdfReader(PdfDocCommon):
                         self.xref[generation] = {}  # type: ignore[index]
                     if not used_before(num, generation):
                         self.xref[generation][num] = byte_offset  # type: ignore[index]
+                        self.xref_object_sources[(generation, num)] = ObjectSource(
+                            object_number=num,
+                            generation=generation,
+                            kind="uncompressed",
+                            xref_type=segment.kind,
+                            xref_offset=segment.offset,
+                            xref_object_number=segment.object_number,
+                            file_offset=cast(int, byte_offset),
+                        )
                 elif xref_type == 2:
                     # compressed objects
                     objstr_num = get_entry(1)
@@ -1499,6 +1845,16 @@ class PdfReader(PdfDocCommon):
                     generation = 0  # PDF spec table 18, generation is 0
                     if not used_before(num, generation):
                         self.xref_objStm[num] = (objstr_num, obstr_idx)
+                        self.xref_object_sources[(generation, num)] = ObjectSource(
+                            object_number=num,
+                            generation=generation,
+                            kind="compressed",
+                            xref_type=segment.kind,
+                            xref_offset=segment.offset,
+                            xref_object_number=segment.object_number,
+                            object_stream_number=cast(int, objstr_num),
+                            object_stream_index=cast(int, obstr_idx),
+                        )
                 elif self.strict:
                     raise PdfReadError(f"Unknown xref type: {xref_type}")
 
